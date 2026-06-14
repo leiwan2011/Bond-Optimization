@@ -1,0 +1,6 @@
+.DS_Store
+Input/
+Output/
+node_modules
+__pycache__/
+*.pyc
