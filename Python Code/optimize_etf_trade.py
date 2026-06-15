@@ -58,6 +58,7 @@ COLUMN_MAPPING = {
     "dealer_inventory": "Dealer Inventory",
     "bmk_weight": "Bmk Weight",
     "issued_amount": "Issued Amount",
+    "price": "Price",
 
     # Required classification field
     "sector": "Sector",
@@ -65,7 +66,6 @@ COLUMN_MAPPING = {
     # Optional descriptive fields used only in output files
     "ticker": "Ticker",
     "name": "Name",
-    "price": "Price",
     "maturity": "Maturity",
     "coupon": "Coupon (%)",
 }
@@ -154,6 +154,7 @@ def validate_required_columns(fieldnames):
         "dealer_inventory",
         "bmk_weight",
         "issued_amount",
+        "price",
         "sector",
     ]
     missing = [
@@ -213,10 +214,13 @@ def read_holdings(path):
         dealer_inventory = parse_number(input_value(row, "dealer_inventory"))
         bmk_weight = parse_number(input_value(row, "bmk_weight"))
         issued_amount = parse_number(input_value(row, "issued_amount"))
+        price = parse_number(input_value(row, "price"))
         if shares <= 0 or market_value <= 0:
             continue
+        if price <= 0:
+            continue
 
-        price_per_share = market_value / shares
+        price_per_share = price / 100.0
         group = sector_group(input_value(row, "sector"))
         bucket = duration_bucket(duration)
         row["_row_number"] = row_number
@@ -226,6 +230,7 @@ def read_holdings(path):
         row["_dealer_inventory"] = dealer_inventory
         row["_bmk_weight"] = bmk_weight
         row["_issued_amount"] = issued_amount
+        row["_price"] = price
         row["_price_per_share"] = price_per_share
         row["_sector_group"] = group
         row["_duration_bucket"] = bucket
@@ -378,7 +383,7 @@ def post_trade_portfolio_duration(holdings, trades, side):
     """Calculate portfolio duration after applying create/redemption trades.
 
     Create adds the selected trade shares to the portfolio. Redemption subtracts
-    them. Prices are held constant from the input file's Market Value / Shares.
+    them. Prices are held constant from the input file's Price column.
     """
     sign = 1 if side == "create" else -1
     signed_trades = {
