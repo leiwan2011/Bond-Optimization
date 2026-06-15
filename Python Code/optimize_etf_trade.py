@@ -87,6 +87,10 @@ GOV_SECTORS = {"provincial", "municipal"}
 DEFAULT_SECTOR_GROUP = "corporate"
 
 # 5) Trade and ETF assumptions
+#    These are the main parameters most users change between runs.
+#    side must be "create" or "redemption".
+DEFAULT_SIDE = "create"
+DEFAULT_PNU = 1.0
 DEFAULT_UNITS_PER_PNU = 50_000.0
 DEFAULT_NAV_CAD = 28.22
 DEFAULT_MAX_VALUE_GAP_CAD = 300.0
@@ -1429,8 +1433,8 @@ def main():
     parser = argparse.ArgumentParser(description="Optimize an XBB create/redemption basket from dealer inventory.")
     parser.add_argument("--input", type=Path, default=DEFAULT_INPUT)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
-    parser.add_argument("--side", choices=["create", "redemption"], required=True)
-    parser.add_argument("--pnu", type=float, default=1.0, help="Number of PNUs to create/redeem.")
+    parser.add_argument("--side", choices=["create", "redemption"], default=DEFAULT_SIDE)
+    parser.add_argument("--pnu", type=float, default=DEFAULT_PNU, help="Number of PNUs to create/redeem.")
     parser.add_argument("--units-per-pnu", type=float, default=DEFAULT_UNITS_PER_PNU)
     parser.add_argument("--nav", type=float, default=DEFAULT_NAV_CAD)
     parser.add_argument("--max-global-duration-gap", type=float, default=DEFAULT_MAX_GLOBAL_DURATION_GAP)
@@ -1449,6 +1453,8 @@ def main():
         help="Allow securities without positive Dealer Inventory. Default uses only Dealer Inventory > 0.",
     )
     args = parser.parse_args()
+    if args.side not in {"create", "redemption"}:
+        raise ValueError('DEFAULT_SIDE must be "create" or "redemption".')
 
     # Load and normalize the source holdings. The optimizer works from enriched
     # internal fields, while the original row values remain available for output.
