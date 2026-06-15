@@ -363,6 +363,46 @@ def build_candidates(holdings, side, require_dealer_inventory):
     return candidates
 
 
+def filter_combo_targets_for_available_inventory(candidates, combo_targets, min_securities_per_combo):
+    """Keep only sector-duration combos that can support combo-level rules.
+
+    A portfolio may contain benchmark weight in a sector-duration combo where
+    the dealer provides no eligible inventory. In that case the optimizer should
+    still run: it drops only the most granular combo-level coverage rule for
+    that combo, while keeping the broader duration-bucket and global targets.
+    """
+    eligible_row_ids = defaultdict(set)
+    for candidate in candidates:
+        combo = candidate["row"]["_bucket_key"]
+        if combo in combo_targets:
+            eligible_row_ids[combo].add(candidate["row"]["_row_number"])
+
+    active_targets = {}
+    skipped_targets = []
+    for combo, target in sorted(combo_targets.items()):
+        eligible_count = len(eligible_row_ids.get(combo, set()))
+        if eligible_count >= min_securities_per_combo:
+            active_targets[combo] = target
+            continue
+
+        skipped_targets.append({
+            "combo": combo,
+            "sector_group": target["sector_group"],
+            "duration_bucket": target["duration_bucket"],
+            "eligible_security_count": eligible_count,
+            "required_security_count": min_securities_per_combo,
+            "target_market_value_cad": round(target["target_value"], 2),
+            "target_duration": round(target["target_duration"], 6),
+            "reason": (
+                "no eligible Dealer Inventory"
+                if eligible_count == 0
+                else "not enough eligible Dealer Inventory names"
+            ),
+        })
+
+    return active_targets, skipped_targets
+
+
 def portfolio_stats(trades):
     """Return total market value and value-weighted duration of a trade basket."""
     total_value = sum(t["shares_abs"] * t["row"]["_price_per_share"] for t in trades.values())
@@ -876,19 +916,6 @@ def optimize_trade_with_duration_constraints(
         if combo in combo_targets:
             candidates_by_combo[combo].append(candidate)
 
-    missing = sorted(set(combo_targets) - set(candidates_by_combo))
-    if missing:
-        raise ValueError(f"No eligible Dealer Inventory in sector-duration combo(s): {', '.join(missing)}")
-    too_few = sorted(
-        combo for combo, items in candidates_by_combo.items()
-        if len({item["row"]["_row_number"] for item in items}) < min_securities_per_combo
-    )
-    if too_few:
-        raise ValueError(
-            "Not enough eligible Dealer Inventory names for minimum security count in combo(s): "
-            + ", ".join(too_few)
-        )
-
     combo_trades = []
     for combo in sorted(combo_targets):
         target = combo_targets[combo]
@@ -1010,7 +1037,11 @@ def optimize_trade_with_duration_constraints(
         for row_id, trade in trades.items():
             lots = int(trade["shares_abs"] // ROUND_LOT)
             combo = trade["row"]["_bucket_key"]
-            if lots > 1 or current_counts[combo] > min_securities_per_combo:
+            if (
+                combo not in combo_targets
+                or lots > 1
+                or current_counts[combo] > min_securities_per_combo
+            ):
                 operations.append(("remove", row_id))
 
         best_operation = None
@@ -1223,13 +1254,18 @@ def main():
     # Split the overall target into duration buckets and sector-duration combos
     # using Bmk Weight, not current market-value weights.
     bucket_targets = duration_bucket_targets(holdings, target_value)
-    combo_targets = sector_duration_targets(holdings, target_value)
+    all_combo_targets = sector_duration_targets(holdings, target_value)
 
     # Candidate max_lots encodes create/redemption differences:
     # create is capped by dealer inventory; redemption is capped by both current
     # shares and dealer inventory.
     require_dealer_inventory = not args.allow_non_inventory
     candidates = build_candidates(holdings, side, require_dealer_inventory)
+    combo_targets, skipped_combo_targets = filter_combo_targets_for_available_inventory(
+        candidates,
+        all_combo_targets,
+        args.min_securities_per_combo,
+    )
     suffix_cash = f"{abs(args.cash_spend_raise):,.0f}".replace(",", "")
     suffix = f"{side}_cash_{suffix_cash}"
 
@@ -1362,6 +1398,10 @@ def main():
         "duration_constraints_pass": global_duration_pass and bucket_duration_pass,
         "duration_constraint_violations": duration_constraint_violations,
         "min_securities_per_combo": args.min_securities_per_combo,
+        "sector_duration_combo_targets_total": len(all_combo_targets),
+        "sector_duration_combo_targets_active": len(combo_targets),
+        "sector_duration_combo_targets_skipped": len(skipped_combo_targets),
+        "skipped_sector_duration_combos": skipped_combo_targets,
         "min_combo_security_pass": min_combo_security_pass,
         "security_count_violations": security_count_violations,
         "number_of_securities": len(output_rows),
@@ -1388,7 +1428,7 @@ def main():
     write_csv(trades_path, output_rows, list(output_rows[0].keys()) if output_rows else ["Ticker"])
     bucket_rows = summarize_by_duration_bucket(trades, bucket_targets)
     write_csv(bucket_path, bucket_rows, list(bucket_rows[0].keys()) if bucket_rows else ["Bucket"])
-    combo_rows = summarize_by_sector_duration_combo(trades, combo_targets)
+    combo_rows = summarize_by_sector_duration_combo(trades, all_combo_targets)
     write_csv(combo_path, combo_rows, list(combo_rows[0].keys()) if combo_rows else ["Combo"])
     complete_rows = summarize_complete_portfolio(holdings, trades, side)
     write_csv(complete_path, complete_rows, list(complete_rows[0].keys()) if complete_rows else ["Ticker"])

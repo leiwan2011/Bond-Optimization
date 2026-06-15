@@ -317,6 +317,45 @@ def build_candidates(holdings, side, require_dealer_inventory):
     return candidates
 
 
+def filter_combo_targets_for_available_inventory(candidates, combo_targets, min_securities_per_combo):
+    """Keep only sector-duration combos that can support combo-level rules.
+
+    If a benchmark combo has no eligible dealer inventory, the model should not
+    fail immediately. It drops only that granular combo-level coverage rule and
+    keeps solving against value, duration-bucket, and global duration targets.
+    """
+    eligible_row_ids = defaultdict(set)
+    for candidate in candidates:
+        combo = candidate["row"]["_bucket_key"]
+        if combo in combo_targets:
+            eligible_row_ids[combo].add(candidate["row"]["_row_number"])
+
+    active_targets = {}
+    skipped_targets = []
+    for combo, target in sorted(combo_targets.items()):
+        eligible_count = len(eligible_row_ids.get(combo, set()))
+        if eligible_count >= min_securities_per_combo:
+            active_targets[combo] = target
+            continue
+
+        skipped_targets.append({
+            "combo": combo,
+            "sector_group": target["sector_group"],
+            "duration_bucket": target["duration_bucket"],
+            "eligible_security_count": eligible_count,
+            "required_security_count": min_securities_per_combo,
+            "target_market_value_cad": round(target["target_value"], 2),
+            "target_duration": round(target["target_duration"], 6),
+            "reason": (
+                "no eligible Dealer Inventory"
+                if eligible_count == 0
+                else "not enough eligible Dealer Inventory names"
+            ),
+        })
+
+    return active_targets, skipped_targets
+
+
 def add_abs_gap_constraints(problem, value, name):
     """Create a non-negative variable equal to at least abs(value)."""
     gap = pulp.LpVariable(name, lowBound=0)
@@ -354,20 +393,6 @@ def solve_with_pulp(
         candidate["model_index"] = idx
         candidates_by_combo[candidate["row"]["_bucket_key"]].append(candidate)
         candidates_by_bucket[candidate["row"]["_duration_bucket"]].append(candidate)
-
-    missing = sorted(set(combo_targets) - set(candidates_by_combo))
-    if missing:
-        raise ValueError(f"No eligible Dealer Inventory in sector-duration combo(s): {', '.join(missing)}")
-
-    too_few = sorted(
-        combo for combo, items in candidates_by_combo.items()
-        if len({item["row"]["_row_number"] for item in items}) < min_securities_per_combo
-    )
-    if too_few:
-        raise ValueError(
-            "Not enough eligible Dealer Inventory names for minimum security count in combo(s): "
-            + ", ".join(too_few)
-        )
 
     problem = pulp.LpProblem("ETF_Trade_Basket", pulp.LpMinimize)
     lots = {}
@@ -705,9 +730,14 @@ def main():
     holdings = read_holdings(args.input)
     target_duration = benchmark_weighted_duration(holdings)
     bucket_targets = duration_bucket_targets(holdings, target_value)
-    combo_targets = sector_duration_targets(holdings, target_value)
+    all_combo_targets = sector_duration_targets(holdings, target_value)
     require_dealer_inventory = not args.allow_non_inventory
     candidates = build_candidates(holdings, side, require_dealer_inventory)
+    combo_targets, skipped_combo_targets = filter_combo_targets_for_available_inventory(
+        candidates,
+        all_combo_targets,
+        args.min_securities_per_combo,
+    )
 
     trades, solver_summary = solve_with_pulp(
         candidates,
@@ -826,6 +856,10 @@ def main():
         "duration_constraints_pass": global_duration_pass and bucket_duration_pass,
         "duration_constraint_violations": duration_constraint_violations,
         "min_securities_per_combo": args.min_securities_per_combo,
+        "sector_duration_combo_targets_total": len(all_combo_targets),
+        "sector_duration_combo_targets_active": len(combo_targets),
+        "sector_duration_combo_targets_skipped": len(skipped_combo_targets),
+        "skipped_sector_duration_combos": skipped_combo_targets,
         "min_combo_security_pass": min_combo_security_pass,
         "security_count_violations": security_count_violations,
         "number_of_securities": len(output_rows),
@@ -848,7 +882,7 @@ def main():
     write_csv(trades_path, output_rows, list(output_rows[0].keys()) if output_rows else ["Ticker"])
     bucket_rows = summarize_by_duration_bucket(trades, bucket_targets)
     write_csv(bucket_path, bucket_rows, list(bucket_rows[0].keys()) if bucket_rows else ["Bucket"])
-    combo_rows = summarize_by_sector_duration_combo(trades, combo_targets)
+    combo_rows = summarize_by_sector_duration_combo(trades, all_combo_targets)
     write_csv(combo_path, combo_rows, list(combo_rows[0].keys()) if combo_rows else ["Combo"])
     complete_rows = summarize_complete_portfolio(holdings, trades, side)
     write_csv(complete_path, complete_rows, list(complete_rows[0].keys()) if complete_rows else ["Ticker"])
