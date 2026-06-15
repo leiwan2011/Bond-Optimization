@@ -1120,6 +1120,222 @@ def summarize_by_sector_duration_combo(trades, combo_targets):
     return output
 
 
+def candidate_universe_stats(candidates, target):
+    """Summarize eligible candidate capacity for one bucket or combo.
+
+    Pre-flight diagnostics use this before optimization starts. The purpose is
+    to answer business questions such as:
+    - Are there enough eligible names?
+    - Is available market value large enough for the target allocation?
+    - Is the target duration even reachable from available inventory?
+    """
+    max_value = 0.0
+    capacity_duration_value = 0.0
+    durations = []
+    for candidate in candidates:
+        capacity_value = candidate["max_lots"] * candidate["lot_value"]
+        max_value += capacity_value
+        capacity_duration_value += capacity_value * candidate["duration"]
+        durations.append(candidate["duration"])
+
+    target_value = target["target_value"]
+    target_duration = target["target_duration"]
+    min_duration = min(durations) if durations else None
+    max_duration = max(durations) if durations else None
+    capacity_weighted_duration = capacity_duration_value / max_value if max_value else None
+
+    if not durations:
+        duration_status = "no eligible candidates"
+    elif target_duration < min_duration:
+        duration_status = "target below available range"
+    elif target_duration > max_duration:
+        duration_status = "target above available range"
+    else:
+        duration_status = "target within available range"
+
+    return {
+        "eligible_securities": len({c["row"]["_row_number"] for c in candidates}),
+        "max_trade_market_value": max_value,
+        "target_market_value": target_value,
+        "capacity_gap": max_value - target_value,
+        "target_duration": target_duration,
+        "min_available_duration": min_duration,
+        "max_available_duration": max_duration,
+        "capacity_weighted_duration": capacity_weighted_duration,
+        "duration_status": duration_status,
+    }
+
+
+def build_preflight_diagnostics(
+    holdings,
+    candidates,
+    target_value,
+    target_duration,
+    bucket_targets,
+    combo_targets,
+    side,
+    min_securities_per_combo,
+):
+    """Build a migration-friendly diagnostic report before optimization.
+
+    This is intentionally separate from the optimizer. It checks whether the
+    input data and eligible dealer inventory make sense before the script spends
+    time trying to construct a basket.
+    """
+    candidates_by_bucket = defaultdict(list)
+    candidates_by_combo = defaultdict(list)
+    for candidate in candidates:
+        row = candidate["row"]
+        candidates_by_bucket[row["_duration_bucket"]].append(candidate)
+        candidates_by_combo[row["_bucket_key"]].append(candidate)
+
+    raw_sector_counts = defaultdict(int)
+    sector_group_counts = defaultdict(int)
+    duration_bucket_counts = defaultdict(int)
+    combo_holding_counts = defaultdict(int)
+    rows_with_dealer_inventory = 0
+    rows_with_bmk_weight = 0
+    out_of_range_rows = 0
+    total_bmk_weight = 0.0
+    total_market_value = 0.0
+
+    for row in holdings:
+        raw_sector_counts[str(input_value(row, "sector")).strip() or "(blank)"] += 1
+        sector_group_counts[row["_sector_group"]] += 1
+        duration_bucket_counts[row["_duration_bucket"]] += 1
+        combo_holding_counts[row["_bucket_key"]] += 1
+        if row["_dealer_inventory"] >= ROUND_LOT:
+            rows_with_dealer_inventory += 1
+        if row["_bmk_weight"] > 0:
+            rows_with_bmk_weight += 1
+        if row["_duration_bucket"] == "out-of-range":
+            out_of_range_rows += 1
+        total_bmk_weight += row["_bmk_weight"]
+        total_market_value += row["_market_value"]
+
+    summary = {
+        "side": side,
+        "target_market_value": round(target_value, 2),
+        "benchmark_duration": round(target_duration, 6),
+        "holdings_loaded": len(holdings),
+        "total_market_value": round(total_market_value, 2),
+        "total_bmk_weight": round(total_bmk_weight, 8),
+        "rows_with_positive_bmk_weight": rows_with_bmk_weight,
+        "rows_with_dealer_inventory_at_least_round_lot": rows_with_dealer_inventory,
+        "eligible_candidate_count": len(candidates),
+        "out_of_range_duration_rows": out_of_range_rows,
+        "round_lot": ROUND_LOT,
+        "min_securities_per_combo": min_securities_per_combo,
+        "sector_group_counts": dict(sorted(sector_group_counts.items())),
+        "duration_bucket_counts": dict(sorted(duration_bucket_counts.items())),
+        "raw_sector_counts": dict(sorted(raw_sector_counts.items())),
+    }
+
+    bucket_rows = []
+    for bucket in sorted(bucket_targets):
+        target = bucket_targets[bucket]
+        stats = candidate_universe_stats(candidates_by_bucket[bucket], target)
+        bucket_rows.append({
+            "Duration Bucket": bucket,
+            "Holdings Rows": duration_bucket_counts[bucket],
+            "Eligible Securities": stats["eligible_securities"],
+            "Target Market Value": fmt_money(stats["target_market_value"]),
+            "Max Available Market Value": fmt_money(stats["max_trade_market_value"]),
+            "Capacity Gap": fmt_money(stats["capacity_gap"]),
+            "Target Duration": f"{stats['target_duration']:.4f}",
+            "Min Available Duration": "" if stats["min_available_duration"] is None else f"{stats['min_available_duration']:.4f}",
+            "Max Available Duration": "" if stats["max_available_duration"] is None else f"{stats['max_available_duration']:.4f}",
+            "Capacity Weighted Duration": "" if stats["capacity_weighted_duration"] is None else f"{stats['capacity_weighted_duration']:.4f}",
+            "Duration Status": stats["duration_status"],
+        })
+
+    combo_rows = []
+    messages = []
+    for combo in sorted(combo_targets):
+        target = combo_targets[combo]
+        stats = candidate_universe_stats(candidates_by_combo[combo], target)
+        security_shortfall = max(0, min_securities_per_combo - stats["eligible_securities"])
+        combo_rows.append({
+            "Combo": combo,
+            "Sector Group": target["sector_group"],
+            "Duration Bucket": target["duration_bucket"],
+            "Holdings Rows": combo_holding_counts[combo],
+            "Eligible Securities": stats["eligible_securities"],
+            "Security Shortfall": security_shortfall,
+            "Target Market Value": fmt_money(stats["target_market_value"]),
+            "Max Available Market Value": fmt_money(stats["max_trade_market_value"]),
+            "Capacity Gap": fmt_money(stats["capacity_gap"]),
+            "Target Duration": f"{stats['target_duration']:.4f}",
+            "Min Available Duration": "" if stats["min_available_duration"] is None else f"{stats['min_available_duration']:.4f}",
+            "Max Available Duration": "" if stats["max_available_duration"] is None else f"{stats['max_available_duration']:.4f}",
+            "Capacity Weighted Duration": "" if stats["capacity_weighted_duration"] is None else f"{stats['capacity_weighted_duration']:.4f}",
+            "Duration Status": stats["duration_status"],
+        })
+
+        if stats["eligible_securities"] == 0:
+            messages.append(
+                f"{combo}: no eligible candidates. Check Dealer Inventory, current shares for redemption, "
+                "Issued Amount cap, sector mapping, and duration bucket mapping."
+            )
+        elif security_shortfall:
+            messages.append(
+                f"{combo}: not enough eligible securities. Required = {min_securities_per_combo}, "
+                f"available = {stats['eligible_securities']}."
+            )
+        if stats["capacity_gap"] < 0:
+            messages.append(
+                f"{combo}: capacity shortfall. Target value = {stats['target_market_value']:.2f}, "
+                f"max available value = {stats['max_trade_market_value']:.2f}."
+            )
+        if stats["duration_status"] == "target above available range":
+            messages.append(
+                f"{combo}: duration target unreachable. Target duration = {stats['target_duration']:.4f}, "
+                f"max available duration = {stats['max_available_duration']:.4f}. "
+                "Even if all eligible inventory is used, this combo remains too short."
+            )
+        elif stats["duration_status"] == "target below available range":
+            messages.append(
+                f"{combo}: duration target unreachable. Target duration = {stats['target_duration']:.4f}, "
+                f"min available duration = {stats['min_available_duration']:.4f}. "
+                "Even if all eligible inventory is used, this combo remains too long."
+            )
+
+    if not holdings:
+        messages.append("No holdings were loaded. Check the input file path and required numeric columns.")
+    if total_bmk_weight <= 0:
+        messages.append("Total Bmk Weight is zero. Check COLUMN_MAPPING for bmk_weight and the input values.")
+    if out_of_range_rows:
+        messages.append(
+            f"{out_of_range_rows} rows have duration outside configured DURATION_BUCKETS. "
+            "Check duration values or update DURATION_BUCKETS."
+        )
+    if not candidates:
+        messages.append("No eligible candidates after applying Dealer Inventory, side, round lot, and Issued Amount caps.")
+
+    return summary, bucket_rows, combo_rows, messages
+
+
+def write_preflight_diagnostics(output_dir, suffix, summary, bucket_rows, combo_rows, messages):
+    """Write pre-flight diagnostic files and return their paths."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    summary_path = output_dir / f"preflight_{suffix}_summary.json"
+    bucket_path = output_dir / f"preflight_{suffix}_bucket_diagnostics.csv"
+    combo_path = output_dir / f"preflight_{suffix}_combo_diagnostics.csv"
+    messages_path = output_dir / f"preflight_{suffix}_messages.txt"
+
+    summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    write_csv(bucket_path, bucket_rows, list(bucket_rows[0].keys()) if bucket_rows else ["Duration Bucket"])
+    write_csv(combo_path, combo_rows, list(combo_rows[0].keys()) if combo_rows else ["Combo"])
+    messages_path.write_text("\n".join(messages) + ("\n" if messages else "No pre-flight issues found.\n"), encoding="utf-8")
+
+    return {
+        "preflight_summary": str(summary_path),
+        "preflight_bucket_diagnostics": str(bucket_path),
+        "preflight_combo_diagnostics": str(combo_path),
+        "preflight_messages": str(messages_path),
+    }
+
+
 def write_csv(path, rows, fieldnames):
     """Write a list of dictionaries to CSV with a fixed header order."""
     with path.open("w", newline="", encoding="utf-8") as handle:
@@ -1150,6 +1366,16 @@ def main():
     parser.add_argument("--max-value-gap", type=float, default=DEFAULT_MAX_VALUE_GAP_CAD)
     parser.add_argument("--min-securities-per-combo", type=int, default=DEFAULT_MIN_SECURITIES_PER_COMBO)
     parser.add_argument(
+        "--diagnostics-only",
+        action="store_true",
+        help="Run pre-flight diagnostics and stop before optimization.",
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Write pre-flight diagnostics before running optimization.",
+    )
+    parser.add_argument(
         "--allow-non-inventory",
         action="store_true",
         help="Allow securities without positive Dealer Inventory. Default uses only Dealer Inventory > 0.",
@@ -1177,6 +1403,38 @@ def main():
     # shares and dealer inventory.
     require_dealer_inventory = not args.allow_non_inventory
     candidates = build_candidates(holdings, args.side, require_dealer_inventory)
+
+    # Pre-flight diagnostics are useful when moving the script to a new office
+    # environment. They explain whether the input file, mappings, inventory,
+    # capacity, and duration ranges look usable before optimization starts.
+    side_label = "create" if args.side == "create" else "redemption"
+    suffix = f"{side_label}_{args.pnu:g}pnu".replace(".", "p")
+    if args.debug or args.diagnostics_only:
+        preflight_summary, preflight_bucket_rows, preflight_combo_rows, preflight_messages = build_preflight_diagnostics(
+            holdings,
+            candidates,
+            target_value,
+            target_duration,
+            bucket_targets,
+            combo_targets,
+            args.side,
+            args.min_securities_per_combo,
+        )
+        preflight_paths = write_preflight_diagnostics(
+            args.output_dir,
+            suffix,
+            preflight_summary,
+            preflight_bucket_rows,
+            preflight_combo_rows,
+            preflight_messages,
+        )
+        print(json.dumps({
+            **preflight_paths,
+            "preflight_issue_count": len(preflight_messages),
+            "first_preflight_messages": preflight_messages[:10],
+        }, indent=2))
+        if args.diagnostics_only:
+            return
 
     # Build the trade basket. If hard constraints cannot all be satisfied, this
     # still returns the best effort basket and the summary below records failures.
@@ -1318,8 +1576,6 @@ def main():
         "max_trade_fraction_of_issued_amount": MAX_TRADE_FRACTION_OF_ISSUED_AMOUNT,
     }
 
-    side_label = "create" if args.side == "create" else "redemption"
-    suffix = f"{side_label}_{args.pnu:g}pnu".replace(".", "p")
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     # Output files:
