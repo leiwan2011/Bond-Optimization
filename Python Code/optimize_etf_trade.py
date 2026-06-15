@@ -53,18 +53,17 @@ DEFAULT_OUTPUT_DIR = ROOT / "Output"
 COLUMN_MAPPING = {
     # Required numeric fields
     "shares": "Shares",
-    "market_value": "Market Value",
     "duration": "Duration",
     "dealer_inventory": "Dealer Inventory",
     "bmk_weight": "Bmk Weight",
     "issued_amount": "Issued Amount",
     "price": "Price",
+    "ticker": "Ticker",
 
     # Required classification field
     "sector": "Sector",
 
     # Optional descriptive fields used only in output files
-    "ticker": "Ticker",
     "name": "Name",
     "maturity": "Maturity",
     "coupon": "Coupon (%)",
@@ -149,12 +148,12 @@ def validate_required_columns(fieldnames):
     """Fail early if the input CSV does not contain required mapped columns."""
     required_fields = [
         "shares",
-        "market_value",
         "duration",
         "dealer_inventory",
         "bmk_weight",
         "issued_amount",
         "price",
+        "ticker",
         "sector",
     ]
     missing = [
@@ -209,23 +208,19 @@ def read_holdings(path):
     holdings = []
     for row_number, row in enumerate(rows, start=2):
         shares = parse_number(input_value(row, "shares"))
-        market_value = parse_number(input_value(row, "market_value"))
         duration = parse_number(input_value(row, "duration"))
         dealer_inventory = parse_number(input_value(row, "dealer_inventory"))
         bmk_weight = parse_number(input_value(row, "bmk_weight"))
         issued_amount = parse_number(input_value(row, "issued_amount"))
         price = parse_number(input_value(row, "price"))
-        if shares <= 0 or market_value <= 0:
-            continue
         if price <= 0:
             continue
 
-        price_per_share = price / 100.0
+        price_per_share = price
         group = sector_group(input_value(row, "sector"))
         bucket = duration_bucket(duration)
         row["_row_number"] = row_number
         row["_shares"] = shares
-        row["_market_value"] = market_value
         row["_duration"] = duration
         row["_dealer_inventory"] = dealer_inventory
         row["_bmk_weight"] = bmk_weight
@@ -1125,6 +1120,53 @@ def summarize_by_sector_duration_combo(trades, combo_targets):
     return output
 
 
+def summarize_complete_portfolio(holdings, trades, side):
+    """Create one output row for every security in the full portfolio.
+
+    The regular trade list only shows securities selected by the optimizer. This
+    complete file is an audit view: it keeps every loaded holding and adds the
+    calculated Sector Group, Duration Bucket, Trade Shares, and Post-Trade
+    Shares so users can inspect classification results row by row.
+    """
+    sign = 1 if side == "create" else -1
+    signed_trade_shares = {
+        row_id: sign * trade["shares_abs"]
+        for row_id, trade in trades.items()
+    }
+
+    output = []
+    for row in sorted(
+        holdings,
+        key=lambda item: (
+            item["_sector_group"],
+            item["_duration_bucket"],
+            input_value(item, "ticker"),
+            input_value(item, "name"),
+        ),
+    ):
+        trade_shares = signed_trade_shares.get(row["_row_number"], 0)
+        post_trade_shares = row["_shares"] + trade_shares
+        output.append({
+            OUTPUT_COLUMNS["ticker"]: input_value(row, "ticker"),
+            OUTPUT_COLUMNS["name"]: input_value(row, "name"),
+            OUTPUT_COLUMNS["sector"]: input_value(row, "sector"),
+            OUTPUT_COLUMNS["sector_group"]: row["_sector_group"],
+            OUTPUT_COLUMNS["duration_bucket"]: row["_duration_bucket"],
+            OUTPUT_COLUMNS["duration"]: f"{row['_duration']:.4f}",
+            "Bmk Weight": f"{row['_bmk_weight']:.8f}",
+            OUTPUT_COLUMNS["price"]: input_value(row, "price"),
+            OUTPUT_COLUMNS["current_shares"]: fmt_shares(row["_shares"]),
+            OUTPUT_COLUMNS["dealer_inventory"]: fmt_shares(row["_dealer_inventory"]),
+            "Issued Amount": fmt_shares(row["_issued_amount"]),
+            OUTPUT_COLUMNS["trade_shares"]: fmt_shares(trade_shares),
+            OUTPUT_COLUMNS["trade_market_value"]: fmt_money(abs(trade_shares) * row["_price_per_share"]),
+            OUTPUT_COLUMNS["post_trade_shares"]: fmt_shares(post_trade_shares),
+            OUTPUT_COLUMNS["maturity"]: input_value(row, "maturity"),
+            OUTPUT_COLUMNS["coupon"]: input_value(row, "coupon"),
+        })
+    return output
+
+
 def write_csv(path, rows, fieldnames):
     """Write a list of dictionaries to CSV with a fixed header order."""
     with path.open("w", newline="", encoding="utf-8") as handle:
@@ -1335,10 +1377,12 @@ def main():
     # 1. trade list by security
     # 2. duration-bucket summary
     # 3. sector-duration combo summary
-    # 4. JSON pass/fail summary
+    # 4. complete portfolio audit file with every security
+    # 5. JSON pass/fail summary
     trades_path = args.output_dir / f"XBB_trade_optimization_{suffix}.csv"
     bucket_path = args.output_dir / f"XBB_trade_optimization_{suffix}_bucket_summary.csv"
     combo_path = args.output_dir / f"XBB_trade_optimization_{suffix}_combo_summary.csv"
+    complete_path = args.output_dir / f"XBB_trade_optimization_{suffix}_complete_portfolio.csv"
     summary_path = args.output_dir / f"XBB_trade_optimization_{suffix}_summary.json"
 
     write_csv(trades_path, output_rows, list(output_rows[0].keys()) if output_rows else ["Ticker"])
@@ -1346,12 +1390,15 @@ def main():
     write_csv(bucket_path, bucket_rows, list(bucket_rows[0].keys()) if bucket_rows else ["Bucket"])
     combo_rows = summarize_by_sector_duration_combo(trades, combo_targets)
     write_csv(combo_path, combo_rows, list(combo_rows[0].keys()) if combo_rows else ["Combo"])
+    complete_rows = summarize_complete_portfolio(holdings, trades, side)
+    write_csv(complete_path, complete_rows, list(complete_rows[0].keys()) if complete_rows else ["Ticker"])
     summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
 
     print(json.dumps({
         "trades": str(trades_path),
         "bucket_summary": str(bucket_path),
         "combo_summary": str(combo_path),
+        "complete_portfolio": str(complete_path),
         "summary": str(summary_path),
         **summary,
     }, indent=2))
