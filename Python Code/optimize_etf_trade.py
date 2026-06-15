@@ -10,9 +10,8 @@ repairs the basket against value and duration constraints one 1,000-share round
 lot at a time.
 
 Default assumptions:
-- 1 PNU = 50,000 ETF units.
-- XBB NAV = CAD 28.22.
-- Trade amount = pnu * units_per_pnu * nav.
+- Positive Cash Spend/Raise means create/buy.
+- Negative Cash Spend/Raise means redemption/sell.
 - Positive Trade Shares means create/buy.
 - Negative Trade Shares means redemption/sell.
 """
@@ -29,13 +28,10 @@ from pathlib import Path
 # CONFIGURATION SECTION - EDIT THIS BLOCK WHEN MOVING TO A NEW ENVIRONMENT
 # =============================================================================
 #
-# 1) Trade and ETF assumptions
+# 1) Trade assumptions
 #    These are the main parameters most users change between runs.
-#    side must be "create" or "redemption".
-DEFAULT_SIDE = "create"
-DEFAULT_PNU = 1.0
-DEFAULT_UNITS_PER_PNU = 50_000.0
-DEFAULT_NAV_CAD = 28.22
+#    Positive = create/spend cash. Negative = redemption/raise cash.
+DEFAULT_CASH_SPEND_RAISE = 1_411_000.0
 DEFAULT_MAX_VALUE_GAP_CAD = 300.0
 DEFAULT_MAX_GLOBAL_DURATION_GAP = 0.1
 DEFAULT_MAX_BUCKET_DURATION_GAP = 0.2
@@ -1124,294 +1120,6 @@ def summarize_by_sector_duration_combo(trades, combo_targets):
     return output
 
 
-def candidate_universe_stats(candidates, target):
-    """Summarize eligible candidate capacity for one bucket or combo.
-
-    Pre-flight diagnostics use this before optimization starts. The purpose is
-    to answer business questions such as:
-    - Are there enough eligible names?
-    - Is available market value large enough for the target allocation?
-    - Is the target duration even reachable from available inventory?
-    """
-    max_value = 0.0
-    capacity_duration_value = 0.0
-    durations = []
-    for candidate in candidates:
-        capacity_value = candidate["max_lots"] * candidate["lot_value"]
-        max_value += capacity_value
-        capacity_duration_value += capacity_value * candidate["duration"]
-        durations.append(candidate["duration"])
-
-    target_value = target["target_value"]
-    target_duration = target["target_duration"]
-    min_duration = min(durations) if durations else None
-    max_duration = max(durations) if durations else None
-    capacity_weighted_duration = capacity_duration_value / max_value if max_value else None
-
-    if not durations:
-        duration_status = "no eligible candidates"
-    elif target_duration < min_duration:
-        duration_status = "target below available range"
-    elif target_duration > max_duration:
-        duration_status = "target above available range"
-    else:
-        duration_status = "target within available range"
-
-    return {
-        "eligible_securities": len({c["row"]["_row_number"] for c in candidates}),
-        "max_trade_market_value": max_value,
-        "target_market_value": target_value,
-        "capacity_gap": max_value - target_value,
-        "target_duration": target_duration,
-        "min_available_duration": min_duration,
-        "max_available_duration": max_duration,
-        "capacity_weighted_duration": capacity_weighted_duration,
-        "duration_status": duration_status,
-    }
-
-
-def build_preflight_diagnostics(
-    holdings,
-    candidates,
-    target_value,
-    target_duration,
-    bucket_targets,
-    combo_targets,
-    side,
-    min_securities_per_combo,
-):
-    """Build a migration-friendly diagnostic report before optimization.
-
-    This is intentionally separate from the optimizer. It checks whether the
-    input data and eligible dealer inventory make sense before the script spends
-    time trying to construct a basket.
-    """
-    candidates_by_bucket = defaultdict(list)
-    candidates_by_combo = defaultdict(list)
-    for candidate in candidates:
-        row = candidate["row"]
-        candidates_by_bucket[row["_duration_bucket"]].append(candidate)
-        candidates_by_combo[row["_bucket_key"]].append(candidate)
-
-    raw_sector_counts = defaultdict(int)
-    sector_group_counts = defaultdict(int)
-    duration_bucket_counts = defaultdict(int)
-    combo_holding_counts = defaultdict(int)
-    rows_with_dealer_inventory = 0
-    rows_with_bmk_weight = 0
-    out_of_range_rows = 0
-    total_bmk_weight = 0.0
-    total_market_value = 0.0
-
-    for row in holdings:
-        raw_sector_counts[str(input_value(row, "sector")).strip() or "(blank)"] += 1
-        sector_group_counts[row["_sector_group"]] += 1
-        duration_bucket_counts[row["_duration_bucket"]] += 1
-        combo_holding_counts[row["_bucket_key"]] += 1
-        if row["_dealer_inventory"] >= ROUND_LOT:
-            rows_with_dealer_inventory += 1
-        if row["_bmk_weight"] > 0:
-            rows_with_bmk_weight += 1
-        if row["_duration_bucket"] == "out-of-range":
-            out_of_range_rows += 1
-        total_bmk_weight += row["_bmk_weight"]
-        total_market_value += row["_market_value"]
-
-    summary = {
-        "side": side,
-        "target_market_value": round(target_value, 2),
-        "benchmark_duration": round(target_duration, 6),
-        "holdings_loaded": len(holdings),
-        "total_market_value": round(total_market_value, 2),
-        "total_bmk_weight": round(total_bmk_weight, 8),
-        "rows_with_positive_bmk_weight": rows_with_bmk_weight,
-        "rows_with_dealer_inventory_at_least_round_lot": rows_with_dealer_inventory,
-        "eligible_candidate_count": len(candidates),
-        "out_of_range_duration_rows": out_of_range_rows,
-        "round_lot": ROUND_LOT,
-        "min_securities_per_combo": min_securities_per_combo,
-        "sector_group_counts": dict(sorted(sector_group_counts.items())),
-        "duration_bucket_counts": dict(sorted(duration_bucket_counts.items())),
-        "raw_sector_counts": dict(sorted(raw_sector_counts.items())),
-    }
-
-    bucket_rows = []
-    for bucket in sorted(bucket_targets):
-        target = bucket_targets[bucket]
-        stats = candidate_universe_stats(candidates_by_bucket[bucket], target)
-        bucket_rows.append({
-            "Duration Bucket": bucket,
-            "Holdings Rows": duration_bucket_counts[bucket],
-            "Eligible Securities": stats["eligible_securities"],
-            "Target Market Value": fmt_money(stats["target_market_value"]),
-            "Max Available Market Value": fmt_money(stats["max_trade_market_value"]),
-            "Capacity Gap": fmt_money(stats["capacity_gap"]),
-            "Target Duration": f"{stats['target_duration']:.4f}",
-            "Min Available Duration": "" if stats["min_available_duration"] is None else f"{stats['min_available_duration']:.4f}",
-            "Max Available Duration": "" if stats["max_available_duration"] is None else f"{stats['max_available_duration']:.4f}",
-            "Capacity Weighted Duration": "" if stats["capacity_weighted_duration"] is None else f"{stats['capacity_weighted_duration']:.4f}",
-            "Duration Status": stats["duration_status"],
-        })
-
-    combo_rows = []
-    messages = []
-    for combo in sorted(combo_targets):
-        target = combo_targets[combo]
-        stats = candidate_universe_stats(candidates_by_combo[combo], target)
-        security_shortfall = max(0, min_securities_per_combo - stats["eligible_securities"])
-        combo_rows.append({
-            "Combo": combo,
-            "Sector Group": target["sector_group"],
-            "Duration Bucket": target["duration_bucket"],
-            "Holdings Rows": combo_holding_counts[combo],
-            "Eligible Securities": stats["eligible_securities"],
-            "Security Shortfall": security_shortfall,
-            "Target Market Value": fmt_money(stats["target_market_value"]),
-            "Max Available Market Value": fmt_money(stats["max_trade_market_value"]),
-            "Capacity Gap": fmt_money(stats["capacity_gap"]),
-            "Target Duration": f"{stats['target_duration']:.4f}",
-            "Min Available Duration": "" if stats["min_available_duration"] is None else f"{stats['min_available_duration']:.4f}",
-            "Max Available Duration": "" if stats["max_available_duration"] is None else f"{stats['max_available_duration']:.4f}",
-            "Capacity Weighted Duration": "" if stats["capacity_weighted_duration"] is None else f"{stats['capacity_weighted_duration']:.4f}",
-            "Duration Status": stats["duration_status"],
-        })
-
-        if stats["eligible_securities"] == 0:
-            messages.append(
-                f"{combo}: no eligible candidates. Check Dealer Inventory, current shares for redemption, "
-                "Issued Amount cap, sector mapping, and duration bucket mapping."
-            )
-        elif security_shortfall:
-            messages.append(
-                f"{combo}: not enough eligible securities. Required = {min_securities_per_combo}, "
-                f"available = {stats['eligible_securities']}."
-            )
-        if stats["capacity_gap"] < 0:
-            messages.append(
-                f"{combo}: capacity shortfall. Target value = {stats['target_market_value']:.2f}, "
-                f"max available value = {stats['max_trade_market_value']:.2f}."
-            )
-        if stats["duration_status"] == "target above available range":
-            messages.append(
-                f"{combo}: duration target unreachable. Target duration = {stats['target_duration']:.4f}, "
-                f"max available duration = {stats['max_available_duration']:.4f}. "
-                "Even if all eligible inventory is used, this combo remains too short."
-            )
-        elif stats["duration_status"] == "target below available range":
-            messages.append(
-                f"{combo}: duration target unreachable. Target duration = {stats['target_duration']:.4f}, "
-                f"min available duration = {stats['min_available_duration']:.4f}. "
-                "Even if all eligible inventory is used, this combo remains too long."
-            )
-
-    if not holdings:
-        messages.append("No holdings were loaded. Check the input file path and required numeric columns.")
-    if total_bmk_weight <= 0:
-        messages.append("Total Bmk Weight is zero. Check COLUMN_MAPPING for bmk_weight and the input values.")
-    if out_of_range_rows:
-        messages.append(
-            f"{out_of_range_rows} rows have duration outside configured DURATION_BUCKETS. "
-            "Check duration values or update DURATION_BUCKETS."
-        )
-    if not candidates:
-        messages.append("No eligible candidates after applying Dealer Inventory, side, round lot, and Issued Amount caps.")
-
-    return summary, bucket_rows, combo_rows, messages
-
-
-def format_optimizer_log(preflight_summary, combo_rows, messages, final_summary=None):
-    """Build one human-readable log file for migration troubleshooting.
-
-    The optimizer still runs end-to-end. This log is only an audit trail that
-    explains how the input was interpreted and where constraints may be tight.
-    """
-    lines = [
-        "ETF Trade Optimization Log",
-        "=" * 80,
-        "",
-        "Input and Mapping Summary",
-        "-" * 80,
-        f"side: {preflight_summary['side']}",
-        f"target_market_value: {fmt_money(preflight_summary['target_market_value'])}",
-        f"benchmark_duration: {preflight_summary['benchmark_duration']:.6f}",
-        f"holdings_loaded: {preflight_summary['holdings_loaded']}",
-        f"total_market_value: {fmt_money(preflight_summary['total_market_value'])}",
-        f"total_bmk_weight: {preflight_summary['total_bmk_weight']}",
-        f"rows_with_positive_bmk_weight: {preflight_summary['rows_with_positive_bmk_weight']}",
-        f"rows_with_dealer_inventory_at_least_round_lot: {preflight_summary['rows_with_dealer_inventory_at_least_round_lot']}",
-        f"eligible_candidate_count: {preflight_summary['eligible_candidate_count']}",
-        f"out_of_range_duration_rows: {preflight_summary['out_of_range_duration_rows']}",
-        "",
-        "Sector Group Counts",
-        "-" * 80,
-    ]
-    for key, value in preflight_summary["sector_group_counts"].items():
-        lines.append(f"{key}: {value}")
-
-    lines.extend(["", "Duration Bucket Counts", "-" * 80])
-    for key, value in preflight_summary["duration_bucket_counts"].items():
-        lines.append(f"{key}: {value}")
-
-    lines.extend(["", "Pre-Flight Messages", "-" * 80])
-    if messages:
-        lines.extend(messages)
-    else:
-        lines.append("No pre-flight issues found.")
-
-    lines.extend(["", "Sector-Duration Candidate Snapshot", "-" * 80])
-    for row in combo_rows:
-        lines.append(
-            f"{row['Combo']}: eligible={row['Eligible Securities']}, "
-            f"security_shortfall={row['Security Shortfall']}, "
-            f"target_value={row['Target Market Value']}, "
-            f"max_available_value={row['Max Available Market Value']}, "
-            f"target_duration={row['Target Duration']}, "
-            f"available_duration_range={row['Min Available Duration']} to {row['Max Available Duration']}, "
-            f"duration_status={row['Duration Status']}"
-        )
-
-    if final_summary is not None:
-        lines.extend(["", "Final Optimization Result", "-" * 80])
-        keys = [
-            "constraints_pass",
-            "value_constraint_pass",
-            "duration_constraints_pass",
-            "min_combo_security_pass",
-            "target_market_value_cad",
-            "actual_trade_market_value_cad",
-            "market_value_gap_cad",
-            "bmk_duration",
-            "trade_duration",
-            "post_trade_portfolio_duration",
-            "duration_gap",
-            "number_of_securities",
-        ]
-        for key in keys:
-            lines.append(f"{key}: {final_summary.get(key)}")
-
-        if final_summary.get("value_constraint_violation"):
-            lines.append(f"value_constraint_violation: {final_summary['value_constraint_violation']}")
-        if final_summary.get("duration_constraint_violations"):
-            lines.append(f"duration_constraint_violations: {final_summary['duration_constraint_violations']}")
-        if final_summary.get("security_count_violations"):
-            lines.append(f"security_count_violations: {final_summary['security_count_violations']}")
-
-    return "\n".join(lines) + "\n"
-
-
-def write_optimizer_log(log_dir, suffix, preflight_summary, combo_rows, messages, final_summary=None):
-    """Write one text log file if the user provided --log-dir."""
-    if log_dir is None:
-        return None
-    log_dir.mkdir(parents=True, exist_ok=True)
-    path = log_dir / f"optimization_log_{suffix}.txt"
-    path.write_text(
-        format_optimizer_log(preflight_summary, combo_rows, messages, final_summary),
-        encoding="utf-8",
-    )
-    return path
-
-
 def write_csv(path, rows, fieldnames):
     """Write a list of dictionaries to CSV with a fixed header order."""
     with path.open("w", newline="", encoding="utf-8") as handle:
@@ -1428,33 +1136,30 @@ def main():
     - input loading and target calculation
     - optimization
     - validation/summary metrics
-    - three CSV/JSON output files
+    - CSV/JSON output files
     """
     parser = argparse.ArgumentParser(description="Optimize an XBB create/redemption basket from dealer inventory.")
     parser.add_argument("--input", type=Path, default=DEFAULT_INPUT)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
-    parser.add_argument("--side", choices=["create", "redemption"], default=DEFAULT_SIDE)
-    parser.add_argument("--pnu", type=float, default=DEFAULT_PNU, help="Number of PNUs to create/redeem.")
-    parser.add_argument("--units-per-pnu", type=float, default=DEFAULT_UNITS_PER_PNU)
-    parser.add_argument("--nav", type=float, default=DEFAULT_NAV_CAD)
+    parser.add_argument(
+        "--cash-spend-raise",
+        type=float,
+        default=DEFAULT_CASH_SPEND_RAISE,
+        help="Positive cash means create/spend cash; negative cash means redemption/raise cash.",
+    )
     parser.add_argument("--max-global-duration-gap", type=float, default=DEFAULT_MAX_GLOBAL_DURATION_GAP)
     parser.add_argument("--max-bucket-duration-gap", type=float, default=DEFAULT_MAX_BUCKET_DURATION_GAP)
     parser.add_argument("--max-value-gap", type=float, default=DEFAULT_MAX_VALUE_GAP_CAD)
     parser.add_argument("--min-securities-per-combo", type=int, default=DEFAULT_MIN_SECURITIES_PER_COMBO)
-    parser.add_argument(
-        "--log-dir",
-        type=Path,
-        default=None,
-        help="Optional directory for one human-readable optimization log txt file.",
-    )
     parser.add_argument(
         "--allow-non-inventory",
         action="store_true",
         help="Allow securities without positive Dealer Inventory. Default uses only Dealer Inventory > 0.",
     )
     args = parser.parse_args()
-    if args.side not in {"create", "redemption"}:
-        raise ValueError('DEFAULT_SIDE must be "create" or "redemption".')
+    if abs(args.cash_spend_raise) < 1e-9:
+        raise ValueError("cash_spend_raise cannot be zero. Use a positive value for create or a negative value for redemption.")
+    side = "create" if args.cash_spend_raise > 0 else "redemption"
 
     # Load and normalize the source holdings. The optimizer works from enriched
     # internal fields, while the original row values remain available for output.
@@ -1464,8 +1169,9 @@ def main():
     # close to the Bmk Weight weighted duration, regardless of create/redemption.
     target_duration = benchmark_weighted_duration(holdings)
 
-    # Trade notional target. Example: 10 PNU * 50,000 units/PNU * 28.22 NAV.
-    target_value = args.pnu * args.units_per_pnu * args.nav
+    # Trade notional target. Positive cash is create/spend cash; negative cash
+    # is redemption/raise cash. The optimizer works from absolute market value.
+    target_value = abs(args.cash_spend_raise)
 
     # Split the overall target into duration buckets and sector-duration combos
     # using Bmk Weight, not current market-value weights.
@@ -1476,28 +1182,9 @@ def main():
     # create is capped by dealer inventory; redemption is capped by both current
     # shares and dealer inventory.
     require_dealer_inventory = not args.allow_non_inventory
-    candidates = build_candidates(holdings, args.side, require_dealer_inventory)
-
-    # Pre-flight diagnostics are useful when moving the script to a new office
-    # environment. They explain whether the input file, mappings, inventory,
-    # capacity, and duration ranges look usable. The optimizer still runs
-    # end-to-end; diagnostics are written only if --log-dir is provided.
-    side_label = "create" if args.side == "create" else "redemption"
-    suffix = f"{side_label}_{args.pnu:g}pnu".replace(".", "p")
-    preflight_summary = None
-    preflight_combo_rows = None
-    preflight_messages = None
-    if args.log_dir is not None:
-        preflight_summary, _, preflight_combo_rows, preflight_messages = build_preflight_diagnostics(
-            holdings,
-            candidates,
-            target_value,
-            target_duration,
-            bucket_targets,
-            combo_targets,
-            args.side,
-            args.min_securities_per_combo,
-        )
+    candidates = build_candidates(holdings, side, require_dealer_inventory)
+    suffix_cash = f"{abs(args.cash_spend_raise):,.0f}".replace(",", "")
+    suffix = f"{side}_cash_{suffix_cash}"
 
     # Build the trade basket. If hard constraints cannot all be satisfied, this
     # still returns the best effort basket and the summary below records failures.
@@ -1513,10 +1200,10 @@ def main():
         args.min_securities_per_combo,
     )
 
-    # Calculate final diagnostics. These are written to summary.json and are
+    # Calculate final metrics. These are written to summary.json and are
     # also printed to the terminal for quick review.
     actual_value, actual_duration = portfolio_stats(trades)
-    post_trade_duration = post_trade_portfolio_duration(holdings, trades, args.side)
+    post_trade_duration = post_trade_portfolio_duration(holdings, trades, side)
     bucket_gaps = duration_bucket_gaps(trades, bucket_targets)
     combo_gaps = sector_duration_gaps(trades, combo_targets)
     global_gap = actual_duration - target_duration
@@ -1568,7 +1255,7 @@ def main():
 
     # Convert absolute selected shares into signed trade shares:
     # create = positive buy amount; redemption = negative sell amount.
-    sign = 1 if args.side == "create" else -1
+    sign = 1 if side == "create" else -1
     output_rows = []
     for trade in sorted(
         trades.values(),
@@ -1605,10 +1292,8 @@ def main():
     # The summary JSON is the audit trail. It clearly tells users whether the
     # basket passed value, duration, and minimum-security constraints.
     summary = {
-        "side": args.side,
-        "pnu": args.pnu,
-        "units_per_pnu": args.units_per_pnu,
-        "nav_cad": args.nav,
+        "side": side,
+        "cash_spend_raise": round(args.cash_spend_raise, 2),
         "target_market_value_cad": round(target_value, 2),
         "actual_trade_market_value_cad": round(actual_value, 2),
         "market_value_gap_cad": round(value_gap, 2),
@@ -1638,18 +1323,6 @@ def main():
         "issued_amount_multiplier": ISSUED_AMOUNT_MULTIPLIER,
         "max_trade_fraction_of_issued_amount": MAX_TRADE_FRACTION_OF_ISSUED_AMOUNT,
     }
-    log_path = None
-    if args.log_dir is not None:
-        log_path = write_optimizer_log(
-            args.log_dir,
-            suffix,
-            preflight_summary,
-            preflight_combo_rows,
-            preflight_messages,
-            summary,
-        )
-    if log_path is not None:
-        summary["log_path"] = str(log_path)
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1675,7 +1348,6 @@ def main():
         "bucket_summary": str(bucket_path),
         "combo_summary": str(combo_path),
         "summary": str(summary_path),
-        "log": str(log_path) if log_path is not None else None,
         **summary,
     }, indent=2))
 
