@@ -1315,25 +1315,97 @@ def build_preflight_diagnostics(
     return summary, bucket_rows, combo_rows, messages
 
 
-def write_preflight_diagnostics(output_dir, suffix, summary, bucket_rows, combo_rows, messages):
-    """Write pre-flight diagnostic files and return their paths."""
-    output_dir.mkdir(parents=True, exist_ok=True)
-    summary_path = output_dir / f"preflight_{suffix}_summary.json"
-    bucket_path = output_dir / f"preflight_{suffix}_bucket_diagnostics.csv"
-    combo_path = output_dir / f"preflight_{suffix}_combo_diagnostics.csv"
-    messages_path = output_dir / f"preflight_{suffix}_messages.txt"
+def format_optimizer_log(preflight_summary, combo_rows, messages, final_summary=None):
+    """Build one human-readable log file for migration troubleshooting.
 
-    summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
-    write_csv(bucket_path, bucket_rows, list(bucket_rows[0].keys()) if bucket_rows else ["Duration Bucket"])
-    write_csv(combo_path, combo_rows, list(combo_rows[0].keys()) if combo_rows else ["Combo"])
-    messages_path.write_text("\n".join(messages) + ("\n" if messages else "No pre-flight issues found.\n"), encoding="utf-8")
+    The optimizer still runs end-to-end. This log is only an audit trail that
+    explains how the input was interpreted and where constraints may be tight.
+    """
+    lines = [
+        "ETF Trade Optimization Log",
+        "=" * 80,
+        "",
+        "Input and Mapping Summary",
+        "-" * 80,
+        f"side: {preflight_summary['side']}",
+        f"target_market_value: {fmt_money(preflight_summary['target_market_value'])}",
+        f"benchmark_duration: {preflight_summary['benchmark_duration']:.6f}",
+        f"holdings_loaded: {preflight_summary['holdings_loaded']}",
+        f"total_market_value: {fmt_money(preflight_summary['total_market_value'])}",
+        f"total_bmk_weight: {preflight_summary['total_bmk_weight']}",
+        f"rows_with_positive_bmk_weight: {preflight_summary['rows_with_positive_bmk_weight']}",
+        f"rows_with_dealer_inventory_at_least_round_lot: {preflight_summary['rows_with_dealer_inventory_at_least_round_lot']}",
+        f"eligible_candidate_count: {preflight_summary['eligible_candidate_count']}",
+        f"out_of_range_duration_rows: {preflight_summary['out_of_range_duration_rows']}",
+        "",
+        "Sector Group Counts",
+        "-" * 80,
+    ]
+    for key, value in preflight_summary["sector_group_counts"].items():
+        lines.append(f"{key}: {value}")
 
-    return {
-        "preflight_summary": str(summary_path),
-        "preflight_bucket_diagnostics": str(bucket_path),
-        "preflight_combo_diagnostics": str(combo_path),
-        "preflight_messages": str(messages_path),
-    }
+    lines.extend(["", "Duration Bucket Counts", "-" * 80])
+    for key, value in preflight_summary["duration_bucket_counts"].items():
+        lines.append(f"{key}: {value}")
+
+    lines.extend(["", "Pre-Flight Messages", "-" * 80])
+    if messages:
+        lines.extend(messages)
+    else:
+        lines.append("No pre-flight issues found.")
+
+    lines.extend(["", "Sector-Duration Candidate Snapshot", "-" * 80])
+    for row in combo_rows:
+        lines.append(
+            f"{row['Combo']}: eligible={row['Eligible Securities']}, "
+            f"security_shortfall={row['Security Shortfall']}, "
+            f"target_value={row['Target Market Value']}, "
+            f"max_available_value={row['Max Available Market Value']}, "
+            f"target_duration={row['Target Duration']}, "
+            f"available_duration_range={row['Min Available Duration']} to {row['Max Available Duration']}, "
+            f"duration_status={row['Duration Status']}"
+        )
+
+    if final_summary is not None:
+        lines.extend(["", "Final Optimization Result", "-" * 80])
+        keys = [
+            "constraints_pass",
+            "value_constraint_pass",
+            "duration_constraints_pass",
+            "min_combo_security_pass",
+            "target_market_value_cad",
+            "actual_trade_market_value_cad",
+            "market_value_gap_cad",
+            "bmk_duration",
+            "trade_duration",
+            "post_trade_portfolio_duration",
+            "duration_gap",
+            "number_of_securities",
+        ]
+        for key in keys:
+            lines.append(f"{key}: {final_summary.get(key)}")
+
+        if final_summary.get("value_constraint_violation"):
+            lines.append(f"value_constraint_violation: {final_summary['value_constraint_violation']}")
+        if final_summary.get("duration_constraint_violations"):
+            lines.append(f"duration_constraint_violations: {final_summary['duration_constraint_violations']}")
+        if final_summary.get("security_count_violations"):
+            lines.append(f"security_count_violations: {final_summary['security_count_violations']}")
+
+    return "\n".join(lines) + "\n"
+
+
+def write_optimizer_log(log_dir, suffix, preflight_summary, combo_rows, messages, final_summary=None):
+    """Write one text log file if the user provided --log-dir."""
+    if log_dir is None:
+        return None
+    log_dir.mkdir(parents=True, exist_ok=True)
+    path = log_dir / f"optimization_log_{suffix}.txt"
+    path.write_text(
+        format_optimizer_log(preflight_summary, combo_rows, messages, final_summary),
+        encoding="utf-8",
+    )
+    return path
 
 
 def write_csv(path, rows, fieldnames):
@@ -1366,14 +1438,10 @@ def main():
     parser.add_argument("--max-value-gap", type=float, default=DEFAULT_MAX_VALUE_GAP_CAD)
     parser.add_argument("--min-securities-per-combo", type=int, default=DEFAULT_MIN_SECURITIES_PER_COMBO)
     parser.add_argument(
-        "--diagnostics-only",
-        action="store_true",
-        help="Run pre-flight diagnostics and stop before optimization.",
-    )
-    parser.add_argument(
-        "--debug",
-        action="store_true",
-        help="Write pre-flight diagnostics before running optimization.",
+        "--log-dir",
+        type=Path,
+        default=None,
+        help="Optional directory for one human-readable optimization log txt file.",
     )
     parser.add_argument(
         "--allow-non-inventory",
@@ -1406,11 +1474,15 @@ def main():
 
     # Pre-flight diagnostics are useful when moving the script to a new office
     # environment. They explain whether the input file, mappings, inventory,
-    # capacity, and duration ranges look usable before optimization starts.
+    # capacity, and duration ranges look usable. The optimizer still runs
+    # end-to-end; diagnostics are written only if --log-dir is provided.
     side_label = "create" if args.side == "create" else "redemption"
     suffix = f"{side_label}_{args.pnu:g}pnu".replace(".", "p")
-    if args.debug or args.diagnostics_only:
-        preflight_summary, preflight_bucket_rows, preflight_combo_rows, preflight_messages = build_preflight_diagnostics(
+    preflight_summary = None
+    preflight_combo_rows = None
+    preflight_messages = None
+    if args.log_dir is not None:
+        preflight_summary, _, preflight_combo_rows, preflight_messages = build_preflight_diagnostics(
             holdings,
             candidates,
             target_value,
@@ -1420,21 +1492,6 @@ def main():
             args.side,
             args.min_securities_per_combo,
         )
-        preflight_paths = write_preflight_diagnostics(
-            args.output_dir,
-            suffix,
-            preflight_summary,
-            preflight_bucket_rows,
-            preflight_combo_rows,
-            preflight_messages,
-        )
-        print(json.dumps({
-            **preflight_paths,
-            "preflight_issue_count": len(preflight_messages),
-            "first_preflight_messages": preflight_messages[:10],
-        }, indent=2))
-        if args.diagnostics_only:
-            return
 
     # Build the trade basket. If hard constraints cannot all be satisfied, this
     # still returns the best effort basket and the summary below records failures.
@@ -1575,6 +1632,18 @@ def main():
         "issued_amount_multiplier": ISSUED_AMOUNT_MULTIPLIER,
         "max_trade_fraction_of_issued_amount": MAX_TRADE_FRACTION_OF_ISSUED_AMOUNT,
     }
+    log_path = None
+    if args.log_dir is not None:
+        log_path = write_optimizer_log(
+            args.log_dir,
+            suffix,
+            preflight_summary,
+            preflight_combo_rows,
+            preflight_messages,
+            summary,
+        )
+    if log_path is not None:
+        summary["log_path"] = str(log_path)
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1600,6 +1669,7 @@ def main():
         "bucket_summary": str(bucket_path),
         "combo_summary": str(combo_path),
         "summary": str(summary_path),
+        "log": str(log_path) if log_path is not None else None,
         **summary,
     }, indent=2))
 
