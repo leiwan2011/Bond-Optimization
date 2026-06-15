@@ -29,14 +29,28 @@ from pathlib import Path
 # CONFIGURATION SECTION - EDIT THIS BLOCK WHEN MOVING TO A NEW ENVIRONMENT
 # =============================================================================
 #
-# 1) File paths
+# 1) Trade and ETF assumptions
+#    These are the main parameters most users change between runs.
+#    side must be "create" or "redemption".
+DEFAULT_SIDE = "create"
+DEFAULT_PNU = 1.0
+DEFAULT_UNITS_PER_PNU = 50_000.0
+DEFAULT_NAV_CAD = 28.22
+DEFAULT_MAX_VALUE_GAP_CAD = 300.0
+DEFAULT_MAX_GLOBAL_DURATION_GAP = 0.1
+DEFAULT_MAX_BUCKET_DURATION_GAP = 0.2
+DEFAULT_MIN_SECURITIES_PER_COMBO = 2
+ISSUED_AMOUNT_MULTIPLIER = 1000
+MAX_TRADE_FRACTION_OF_ISSUED_AMOUNT = 0.5
+
+# 2) File paths
 #    Change these defaults if your office folder structure is different. You can
 #    also override them from the command line with --input and --output-dir.
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_INPUT = ROOT / "Output" / "XBB_holdings_with_dealer_inventory.csv"
 DEFAULT_OUTPUT_DIR = ROOT / "Output"
 
-# 2) Input table column mapping
+# 3) Input table column mapping
 #    Left side = internal variable used by this script.
 #    Right side = actual column name in your input file.
 #    When your office file uses different headers, change only the right side.
@@ -60,7 +74,7 @@ COLUMN_MAPPING = {
     "coupon": "Coupon (%)",
 }
 
-# 3) Output column names
+# 4) Output column names
 #    Change these only if you want different headers in the generated trade list.
 OUTPUT_COLUMNS = {
     "ticker": "Ticker",
@@ -79,26 +93,12 @@ OUTPUT_COLUMNS = {
     "coupon": "Coupon (%)",
 }
 
-# 4) Sector grouping rules
+# 5) Sector grouping rules
 #    The script maps raw sector names into these three optimization groups.
 #    Edit the sets if your office file uses names like "Government", "Prov", etc.
 FEDERAL_SECTORS = {"federal"}
 GOV_SECTORS = {"provincial", "municipal"}
 DEFAULT_SECTOR_GROUP = "corporate"
-
-# 5) Trade and ETF assumptions
-#    These are the main parameters most users change between runs.
-#    side must be "create" or "redemption".
-DEFAULT_SIDE = "create"
-DEFAULT_PNU = 1.0
-DEFAULT_UNITS_PER_PNU = 50_000.0
-DEFAULT_NAV_CAD = 28.22
-DEFAULT_MAX_VALUE_GAP_CAD = 300.0
-DEFAULT_MAX_GLOBAL_DURATION_GAP = 0.1
-DEFAULT_MAX_BUCKET_DURATION_GAP = 0.2
-DEFAULT_MIN_SECURITIES_PER_COMBO = 2
-ISSUED_AMOUNT_MULTIPLIER = 1000
-MAX_TRADE_FRACTION_OF_ISSUED_AMOUNT = 0.5
 
 # 6) Round lot and duration bucket definitions
 ROUND_LOT = 1000
