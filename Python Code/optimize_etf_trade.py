@@ -216,7 +216,7 @@ def read_holdings(path):
         if price <= 0:
             continue
 
-        price_per_share = price
+        price_per_share = price / 100.0
         group = sector_group(input_value(row, "sector"))
         bucket = duration_bucket(duration)
         row["_row_number"] = row_number
