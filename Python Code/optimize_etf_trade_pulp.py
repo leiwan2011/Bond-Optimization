@@ -17,6 +17,7 @@ import argparse
 import csv
 import json
 import math
+import re
 from collections import defaultdict
 from pathlib import Path
 
@@ -46,6 +47,9 @@ DEFAULT_COMBO_VALUE_GAP_WEIGHT = 0.10
 DEFAULT_CORPORATE_INDUSTRY_GROUP_VALUE_GAP_WEIGHT = 0.10
 DEFAULT_CORPORATE_INDUSTRY_SUBGROUP_VALUE_GAP_WEIGHT = 0.10
 DEFAULT_CORPORATE_ISSUER_VALUE_GAP_WEIGHT = 0.10
+DEFAULT_CATEGORY_AGENCY_SSA_VALUE_GAP_WEIGHT = 0.10
+DEFAULT_QUEBEC_HYDRO_QUEBEC_VALUE_GAP_WEIGHT = 0.10
+DEFAULT_ALBERTA_VALUE_GAP_WEIGHT = 0.10
 ISSUED_AMOUNT_MULTIPLIER = 1000
 MAX_TRADE_FRACTION_OF_ISSUED_AMOUNT = 0.5
 
@@ -69,6 +73,7 @@ COLUMN_MAPPING = {
     "issued_amount": "Issued Amount",
     "price": "Price",
     "ticker": "Ticker",
+    "category": "Category",
 
     # Required classification field
     "sector": "Sector",
@@ -110,7 +115,22 @@ FEDERAL_SECTORS = {"federal"}
 GOV_SECTORS = {"provincial", "municipal"}
 DEFAULT_SECTOR_GROUP = "corporate"
 
-# 6) Round lot and duration bucket definitions
+# 6) Special subsector market-value penalty definitions
+#    Values are compared after lowercase/space/punctuation normalization.
+CATEGORY_AGENCY_SSA_VALUES = {"agency", "ssa"}
+QUEBEC_HYDRO_QUEBEC_ISSUERS = {
+    "province of quebec",
+    "quebec (province of)",
+    "quebec province of",
+    "hydro-quebec",
+}
+ALBERTA_ISSUERS = {
+    "province of alberta",
+    "alberta (province of)",
+    "alberta province of",
+}
+
+# 7) Round lot and duration bucket definitions
 ROUND_LOT = 1000
 DURATION_BUCKETS = (
     ("0-5", 0.0, 5.0, False),
@@ -152,6 +172,17 @@ def clean_group_value(value):
     """Normalize optional grouping fields used by corporate detail penalties."""
     text = str(value or "").strip()
     return text if text else "unclassified"
+
+
+def normalize_match_value(value):
+    """Normalize category/issuer values for configuration-set matching."""
+    text = clean_group_value(value).lower().replace(".", "")
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def normalized_config_values(values):
+    """Normalize all values from a configuration set."""
+    return {normalize_match_value(value) for value in values}
 
 
 def validate_required_columns(fieldnames):
@@ -229,9 +260,12 @@ def read_holdings(path):
         row["_sector_group"] = group
         row["_duration_bucket"] = bucket
         row["_bucket_key"] = f"{group}|{bucket}"
+        row["_category"] = clean_group_value(input_value(row, "category", input_value(row, "sector")))
+        row["_category_normalized"] = normalize_match_value(row["_category"])
         row["_industry_group"] = clean_group_value(input_value(row, "industry_group"))
         row["_industry_subgroup"] = clean_group_value(input_value(row, "industry_subgroup"))
         row["_issuer"] = clean_group_value(input_value(row, "issuer", input_value(row, "name")))
+        row["_issuer_normalized"] = normalize_match_value(row["_issuer"])
         holdings.append(row)
 
     return holdings
@@ -320,6 +354,34 @@ def corporate_combo_detail_targets(holdings, total_trade_value, row_field):
             "detail_value": detail_value,
             "target_value": total_trade_value * weight,
             "row_field": row_field,
+        }
+    return targets
+
+
+def special_subsector_combo_targets(holdings, total_trade_value, group_name, match_field, match_values):
+    """Build target value for a configured special subsector inside each combo."""
+    total_bmk_weight = 0.0
+    group_weights = defaultdict(float)
+    normalized_values = normalized_config_values(match_values)
+
+    for row in holdings:
+        if row["_duration_bucket"] == "out-of-range":
+            continue
+        bmk_weight = row["_bmk_weight"]
+        total_bmk_weight += bmk_weight
+        if row[match_field] not in normalized_values:
+            continue
+        group_weights[row["_bucket_key"]] += bmk_weight
+
+    targets = {}
+    for combo, bmk_weight in group_weights.items():
+        weight = bmk_weight / total_bmk_weight if total_bmk_weight else 0.0
+        targets[combo] = {
+            "group_name": group_name,
+            "combo": combo,
+            "target_value": total_trade_value * weight,
+            "match_field": match_field,
+            "match_values": normalized_values,
         }
     return targets
 
@@ -422,6 +484,7 @@ def solve_with_pulp(
     bucket_targets,
     combo_targets,
     corporate_detail_targets,
+    special_subsector_targets,
     max_global_gap,
     max_bucket_gap,
     max_value_gap,
@@ -431,6 +494,9 @@ def solve_with_pulp(
     corporate_industry_group_value_gap_weight,
     corporate_industry_subgroup_value_gap_weight,
     corporate_issuer_value_gap_weight,
+    category_agency_ssa_value_gap_weight,
+    quebec_hydro_quebec_value_gap_weight,
+    alberta_value_gap_weight,
 ):
     """Solve the ETF basket as a mixed-integer optimization model."""
     if not candidates:
@@ -547,6 +613,39 @@ def solve_with_pulp(
             )
         corporate_detail_value_abs_gaps[detail_name] = abs_gaps
 
+    special_subsector_value_abs_gaps = {}
+    special_subsector_weights = {
+        "category_agency_or_ssa": category_agency_ssa_value_gap_weight,
+        "issuer_quebec_plus_hydro_quebec": quebec_hydro_quebec_value_gap_weight,
+        "issuer_province_of_alberta": alberta_value_gap_weight,
+    }
+    for group_name, targets in sorted(special_subsector_targets.items()):
+        abs_gaps = []
+        for target_index, (combo, target) in enumerate(sorted(targets.items())):
+            if combo not in combo_targets:
+                continue
+            match_field = target["match_field"]
+            match_values = target["match_values"]
+            combo_group_items = [
+                item for item in candidates_by_combo[combo]
+                if item["row"][match_field] in match_values
+            ]
+            if not combo_group_items:
+                continue
+
+            group_value_expr = pulp.lpSum(
+                item["lot_value"] * lots[item["model_index"]]
+                for item in combo_group_items
+            ) - target["target_value"]
+            abs_gaps.append(
+                add_abs_gap_constraints(
+                    problem,
+                    group_value_expr,
+                    f"special_{group_name}_{target_index}_value_abs_gap",
+                )
+            )
+        special_subsector_value_abs_gaps[group_name] = abs_gaps
+
     security_count = pulp.lpSum(selected[candidate["model_index"]] for candidate in candidates)
     # Big weights make the objective behave like business priority:
     # first reduce hard-limit violations, then polish gaps, then use fewer names.
@@ -562,6 +661,10 @@ def solve_with_pulp(
         + pulp.lpSum(
             corporate_detail_weights[detail_name] * pulp.lpSum(abs_gaps)
             for detail_name, abs_gaps in corporate_detail_value_abs_gaps.items()
+        )
+        + pulp.lpSum(
+            special_subsector_weights[group_name] * pulp.lpSum(abs_gaps)
+            for group_name, abs_gaps in special_subsector_value_abs_gaps.items()
         )
         + 1_000 * security_count
     )
@@ -602,6 +705,13 @@ def solve_with_pulp(
         "corporate_detail_value_abs_gap_model": {
             detail_name: pulp.value(pulp.lpSum(abs_gaps))
             for detail_name, abs_gaps in sorted(corporate_detail_value_abs_gaps.items())
+        },
+        "category_agency_ssa_value_gap_weight": category_agency_ssa_value_gap_weight,
+        "quebec_hydro_quebec_value_gap_weight": quebec_hydro_quebec_value_gap_weight,
+        "alberta_value_gap_weight": alberta_value_gap_weight,
+        "special_subsector_value_abs_gap_model": {
+            group_name: pulp.value(pulp.lpSum(abs_gaps))
+            for group_name, abs_gaps in sorted(special_subsector_value_abs_gaps.items())
         },
     }
 
@@ -849,6 +959,24 @@ def main():
         help="Penalty weight for corporate issuer market value gaps inside each combo.",
     )
     parser.add_argument(
+        "--category-agency-ssa-value-gap-weight",
+        type=float,
+        default=DEFAULT_CATEGORY_AGENCY_SSA_VALUE_GAP_WEIGHT,
+        help="Penalty weight for Agency/SSA category market value gaps inside each combo.",
+    )
+    parser.add_argument(
+        "--quebec-hydro-quebec-value-gap-weight",
+        type=float,
+        default=DEFAULT_QUEBEC_HYDRO_QUEBEC_VALUE_GAP_WEIGHT,
+        help="Penalty weight for combined Province of Quebec + Hydro-Quebec market value gaps inside each combo.",
+    )
+    parser.add_argument(
+        "--alberta-value-gap-weight",
+        type=float,
+        default=DEFAULT_ALBERTA_VALUE_GAP_WEIGHT,
+        help="Penalty weight for Province of Alberta market value gaps inside each combo.",
+    )
+    parser.add_argument(
         "--allow-non-inventory",
         action="store_true",
         help="Allow securities without positive Dealer Inventory. Default uses only Dealer Inventory > 0.",
@@ -868,6 +996,29 @@ def main():
         "industry_subgroup": corporate_combo_detail_targets(holdings, target_value, "_industry_subgroup"),
         "issuer": corporate_combo_detail_targets(holdings, target_value, "_issuer"),
     }
+    special_subsector_targets = {
+        "category_agency_or_ssa": special_subsector_combo_targets(
+            holdings,
+            target_value,
+            "category_agency_or_ssa",
+            "_category_normalized",
+            CATEGORY_AGENCY_SSA_VALUES,
+        ),
+        "issuer_quebec_plus_hydro_quebec": special_subsector_combo_targets(
+            holdings,
+            target_value,
+            "issuer_quebec_plus_hydro_quebec",
+            "_issuer_normalized",
+            QUEBEC_HYDRO_QUEBEC_ISSUERS,
+        ),
+        "issuer_province_of_alberta": special_subsector_combo_targets(
+            holdings,
+            target_value,
+            "issuer_province_of_alberta",
+            "_issuer_normalized",
+            ALBERTA_ISSUERS,
+        ),
+    }
     require_dealer_inventory = not args.allow_non_inventory
     candidates = build_candidates(holdings, side, require_dealer_inventory)
     combo_targets, skipped_combo_targets = filter_combo_targets_for_available_inventory(
@@ -883,6 +1034,7 @@ def main():
         bucket_targets,
         combo_targets,
         corporate_detail_targets,
+        special_subsector_targets,
         args.max_global_duration_gap,
         args.max_bucket_duration_gap,
         args.max_value_gap,
@@ -892,6 +1044,9 @@ def main():
         args.corporate_industry_group_value_gap_weight,
         args.corporate_industry_subgroup_value_gap_weight,
         args.corporate_issuer_value_gap_weight,
+        args.category_agency_ssa_value_gap_weight,
+        args.quebec_hydro_quebec_value_gap_weight,
+        args.alberta_value_gap_weight,
     )
 
     actual_value, actual_duration = portfolio_stats(trades)
@@ -996,6 +1151,36 @@ def main():
         "corporate_industry_group_value_gap_weight": args.corporate_industry_group_value_gap_weight,
         "corporate_industry_subgroup_value_gap_weight": args.corporate_industry_subgroup_value_gap_weight,
         "corporate_issuer_value_gap_weight": args.corporate_issuer_value_gap_weight,
+        "category_agency_ssa_value_gap_weight": args.category_agency_ssa_value_gap_weight,
+        "quebec_hydro_quebec_value_gap_weight": args.quebec_hydro_quebec_value_gap_weight,
+        "alberta_value_gap_weight": args.alberta_value_gap_weight,
+        "special_subsector_value_gap_definitions": {
+            "category_agency_or_ssa": {
+                "input_column": COLUMN_MAPPING["category"],
+                "match_values": sorted(CATEGORY_AGENCY_SSA_VALUES),
+                "weight": args.category_agency_ssa_value_gap_weight,
+            },
+            "issuer_quebec_plus_hydro_quebec": {
+                "input_column": COLUMN_MAPPING["issuer"],
+                "match_values": sorted(QUEBEC_HYDRO_QUEBEC_ISSUERS),
+                "weight": args.quebec_hydro_quebec_value_gap_weight,
+            },
+            "issuer_province_of_alberta": {
+                "input_column": COLUMN_MAPPING["issuer"],
+                "match_values": sorted(ALBERTA_ISSUERS),
+                "weight": args.alberta_value_gap_weight,
+            },
+        },
+        "special_subsector_value_gap_targets": {
+            group_name: [
+                {
+                    "combo": combo,
+                    "target_market_value_cad": round(target["target_value"], 2),
+                }
+                for combo, target in sorted(targets.items())
+            ]
+            for group_name, targets in sorted(special_subsector_targets.items())
+        },
         "duration_bucket_gaps": {k: round(v, 6) for k, v in sorted(bucket_gaps.items())},
         "sector_duration_combo_gaps": {k: round(v, 6) for k, v in sorted(combo_gaps.items())},
         "constraints_pass": constraints_passed,
