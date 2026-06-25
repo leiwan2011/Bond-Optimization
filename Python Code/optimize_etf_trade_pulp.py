@@ -42,6 +42,7 @@ DEFAULT_MAX_GLOBAL_DURATION_GAP = 0.1
 DEFAULT_MAX_BUCKET_DURATION_GAP = 0.2
 DEFAULT_MIN_SECURITIES_PER_COMBO = 2
 DEFAULT_SOLVER_TIME_LIMIT_SECONDS = 30
+DEFAULT_COMBO_VALUE_GAP_WEIGHT = 0.10
 ISSUED_AMOUNT_MULTIPLIER = 1000
 MAX_TRADE_FRACTION_OF_ISSUED_AMOUNT = 0.5
 
@@ -382,6 +383,7 @@ def solve_with_pulp(
     max_value_gap,
     min_securities_per_combo,
     time_limit_seconds,
+    combo_value_gap_weight,
 ):
     """Solve the ETF basket as a mixed-integer optimization model."""
     if not candidates:
@@ -438,12 +440,25 @@ def solve_with_pulp(
         bucket_violations.append(violation)
 
     combo_abs_gaps = []
+    combo_value_abs_gaps = []
     for combo, target in sorted(combo_targets.items()):
         combo_items = candidates_by_combo[combo]
         problem += (
             pulp.lpSum(selected[item["model_index"]] for item in combo_items)
             >= min_securities_per_combo
         ), f"min_security_count_{combo}"
+
+        combo_value_expr = pulp.lpSum(
+            item["lot_value"] * lots[item["model_index"]]
+            for item in combo_items
+        ) - target["target_value"]
+        combo_value_abs_gaps.append(
+            add_abs_gap_constraints(
+                problem,
+                combo_value_expr,
+                f"combo_{combo}_value_abs_gap",
+            )
+        )
 
         combo_gap_expr = pulp.lpSum(
             item["lot_value"]
@@ -464,6 +479,7 @@ def solve_with_pulp(
         + global_abs_gap
         + 0.25 * pulp.lpSum(bucket_abs_gaps)
         + 0.10 * pulp.lpSum(combo_abs_gaps)
+        + combo_value_gap_weight * pulp.lpSum(combo_value_abs_gaps)
         + 1_000 * security_count
     )
 
@@ -495,6 +511,8 @@ def solve_with_pulp(
         "value_violation_model": pulp.value(value_violation),
         "global_dollar_duration_abs_gap_model": pulp.value(global_abs_gap),
         "global_duration_violation_model": pulp.value(global_violation),
+        "combo_value_gap_weight": combo_value_gap_weight,
+        "combo_value_abs_gap_model": pulp.value(pulp.lpSum(combo_value_abs_gaps)),
     }
 
 
@@ -717,6 +735,12 @@ def main():
     parser.add_argument("--min-securities-per-combo", type=int, default=DEFAULT_MIN_SECURITIES_PER_COMBO)
     parser.add_argument("--solver-time-limit", type=int, default=DEFAULT_SOLVER_TIME_LIMIT_SECONDS)
     parser.add_argument(
+        "--combo-value-gap-weight",
+        type=float,
+        default=DEFAULT_COMBO_VALUE_GAP_WEIGHT,
+        help="Penalty weight for sector-duration combo market value gaps.",
+    )
+    parser.add_argument(
         "--allow-non-inventory",
         action="store_true",
         help="Allow securities without positive Dealer Inventory. Default uses only Dealer Inventory > 0.",
@@ -750,6 +774,7 @@ def main():
         args.max_value_gap,
         args.min_securities_per_combo,
         args.solver_time_limit,
+        args.combo_value_gap_weight,
     )
 
     actual_value, actual_duration = portfolio_stats(trades)
@@ -850,6 +875,7 @@ def main():
         "duration_gap": round(global_gap, 6),
         "max_global_duration_gap": args.max_global_duration_gap,
         "max_bucket_duration_gap": args.max_bucket_duration_gap,
+        "combo_value_gap_weight": args.combo_value_gap_weight,
         "duration_bucket_gaps": {k: round(v, 6) for k, v in sorted(bucket_gaps.items())},
         "sector_duration_combo_gaps": {k: round(v, 6) for k, v in sorted(combo_gaps.items())},
         "constraints_pass": constraints_passed,
