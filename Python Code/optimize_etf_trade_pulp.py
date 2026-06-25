@@ -43,6 +43,9 @@ DEFAULT_MAX_BUCKET_DURATION_GAP = 0.2
 DEFAULT_MIN_SECURITIES_PER_COMBO = 2
 DEFAULT_SOLVER_TIME_LIMIT_SECONDS = 30
 DEFAULT_COMBO_VALUE_GAP_WEIGHT = 0.10
+DEFAULT_CORPORATE_INDUSTRY_GROUP_VALUE_GAP_WEIGHT = 0.10
+DEFAULT_CORPORATE_INDUSTRY_SUBGROUP_VALUE_GAP_WEIGHT = 0.10
+DEFAULT_CORPORATE_ISSUER_VALUE_GAP_WEIGHT = 0.10
 ISSUED_AMOUNT_MULTIPLIER = 1000
 MAX_TRADE_FRACTION_OF_ISSUED_AMOUNT = 0.5
 
@@ -74,6 +77,11 @@ COLUMN_MAPPING = {
     "name": "Name",
     "maturity": "Maturity",
     "coupon": "Coupon (%)",
+
+    # Optional corporate detail fields used by soft market-value penalties
+    "industry_group": "industry group",
+    "industry_subgroup": "industry subgroup",
+    "issuer": "Issuer",
 }
 
 # 4) Output column names
@@ -138,6 +146,12 @@ def fmt_shares(value):
 def input_value(row, field_name, default=""):
     """Read a value from an input row using COLUMN_MAPPING."""
     return row.get(COLUMN_MAPPING[field_name], default)
+
+
+def clean_group_value(value):
+    """Normalize optional grouping fields used by corporate detail penalties."""
+    text = str(value or "").strip()
+    return text if text else "unclassified"
 
 
 def validate_required_columns(fieldnames):
@@ -215,6 +229,9 @@ def read_holdings(path):
         row["_sector_group"] = group
         row["_duration_bucket"] = bucket
         row["_bucket_key"] = f"{group}|{bucket}"
+        row["_industry_group"] = clean_group_value(input_value(row, "industry_group"))
+        row["_industry_subgroup"] = clean_group_value(input_value(row, "industry_subgroup"))
+        row["_issuer"] = clean_group_value(input_value(row, "issuer", input_value(row, "name")))
         holdings.append(row)
 
     return holdings
@@ -277,6 +294,32 @@ def sector_duration_targets(holdings, total_trade_value):
             "weight": weight,
             "target_value": total_trade_value * weight,
             "target_duration": stats["duration_weight"] / stats["bmk_weight"],
+        }
+    return targets
+
+
+def corporate_combo_detail_targets(holdings, total_trade_value, row_field):
+    """Build target market value for a corporate detail group inside each combo."""
+    total_bmk_weight = 0.0
+    detail_weights = defaultdict(float)
+    for row in holdings:
+        if row["_duration_bucket"] == "out-of-range":
+            continue
+        bmk_weight = row["_bmk_weight"]
+        total_bmk_weight += bmk_weight
+        if row["_sector_group"] != DEFAULT_SECTOR_GROUP:
+            continue
+        key = (row["_bucket_key"], row[row_field])
+        detail_weights[key] += bmk_weight
+
+    targets = {}
+    for (combo, detail_value), bmk_weight in detail_weights.items():
+        weight = bmk_weight / total_bmk_weight if total_bmk_weight else 0.0
+        targets[(combo, detail_value)] = {
+            "combo": combo,
+            "detail_value": detail_value,
+            "target_value": total_trade_value * weight,
+            "row_field": row_field,
         }
     return targets
 
@@ -378,12 +421,16 @@ def solve_with_pulp(
     target_duration,
     bucket_targets,
     combo_targets,
+    corporate_detail_targets,
     max_global_gap,
     max_bucket_gap,
     max_value_gap,
     min_securities_per_combo,
     time_limit_seconds,
     combo_value_gap_weight,
+    corporate_industry_group_value_gap_weight,
+    corporate_industry_subgroup_value_gap_weight,
+    corporate_issuer_value_gap_weight,
 ):
     """Solve the ETF basket as a mixed-integer optimization model."""
     if not candidates:
@@ -468,6 +515,38 @@ def solve_with_pulp(
         )
         combo_abs_gaps.append(add_abs_gap_constraints(problem, combo_gap_expr, f"combo_{combo}_abs_gap"))
 
+    corporate_detail_value_abs_gaps = {}
+    corporate_detail_weights = {
+        "industry_group": corporate_industry_group_value_gap_weight,
+        "industry_subgroup": corporate_industry_subgroup_value_gap_weight,
+        "issuer": corporate_issuer_value_gap_weight,
+    }
+    for detail_name, detail_targets in sorted(corporate_detail_targets.items()):
+        abs_gaps = []
+        for target_index, ((combo, detail_value), target) in enumerate(sorted(detail_targets.items())):
+            if combo not in combo_targets:
+                continue
+            row_field = target["row_field"]
+            combo_detail_items = [
+                item for item in candidates_by_combo[combo]
+                if item["row"][row_field] == detail_value
+            ]
+            if not combo_detail_items:
+                continue
+
+            detail_value_expr = pulp.lpSum(
+                item["lot_value"] * lots[item["model_index"]]
+                for item in combo_detail_items
+            ) - target["target_value"]
+            abs_gaps.append(
+                add_abs_gap_constraints(
+                    problem,
+                    detail_value_expr,
+                    f"corp_{detail_name}_{target_index}_value_abs_gap",
+                )
+            )
+        corporate_detail_value_abs_gaps[detail_name] = abs_gaps
+
     security_count = pulp.lpSum(selected[candidate["model_index"]] for candidate in candidates)
     # Big weights make the objective behave like business priority:
     # first reduce hard-limit violations, then polish gaps, then use fewer names.
@@ -480,6 +559,10 @@ def solve_with_pulp(
         + 0.25 * pulp.lpSum(bucket_abs_gaps)
         + 0.10 * pulp.lpSum(combo_abs_gaps)
         + combo_value_gap_weight * pulp.lpSum(combo_value_abs_gaps)
+        + pulp.lpSum(
+            corporate_detail_weights[detail_name] * pulp.lpSum(abs_gaps)
+            for detail_name, abs_gaps in corporate_detail_value_abs_gaps.items()
+        )
         + 1_000 * security_count
     )
 
@@ -513,6 +596,13 @@ def solve_with_pulp(
         "global_duration_violation_model": pulp.value(global_violation),
         "combo_value_gap_weight": combo_value_gap_weight,
         "combo_value_abs_gap_model": pulp.value(pulp.lpSum(combo_value_abs_gaps)),
+        "corporate_industry_group_value_gap_weight": corporate_industry_group_value_gap_weight,
+        "corporate_industry_subgroup_value_gap_weight": corporate_industry_subgroup_value_gap_weight,
+        "corporate_issuer_value_gap_weight": corporate_issuer_value_gap_weight,
+        "corporate_detail_value_abs_gap_model": {
+            detail_name: pulp.value(pulp.lpSum(abs_gaps))
+            for detail_name, abs_gaps in sorted(corporate_detail_value_abs_gaps.items())
+        },
     }
 
 
@@ -741,6 +831,24 @@ def main():
         help="Penalty weight for sector-duration combo market value gaps.",
     )
     parser.add_argument(
+        "--corporate-industry-group-value-gap-weight",
+        type=float,
+        default=DEFAULT_CORPORATE_INDUSTRY_GROUP_VALUE_GAP_WEIGHT,
+        help="Penalty weight for corporate industry group market value gaps inside each combo.",
+    )
+    parser.add_argument(
+        "--corporate-industry-subgroup-value-gap-weight",
+        type=float,
+        default=DEFAULT_CORPORATE_INDUSTRY_SUBGROUP_VALUE_GAP_WEIGHT,
+        help="Penalty weight for corporate industry subgroup market value gaps inside each combo.",
+    )
+    parser.add_argument(
+        "--corporate-issuer-value-gap-weight",
+        type=float,
+        default=DEFAULT_CORPORATE_ISSUER_VALUE_GAP_WEIGHT,
+        help="Penalty weight for corporate issuer market value gaps inside each combo.",
+    )
+    parser.add_argument(
         "--allow-non-inventory",
         action="store_true",
         help="Allow securities without positive Dealer Inventory. Default uses only Dealer Inventory > 0.",
@@ -755,6 +863,11 @@ def main():
     target_duration = benchmark_weighted_duration(holdings)
     bucket_targets = duration_bucket_targets(holdings, target_value)
     all_combo_targets = sector_duration_targets(holdings, target_value)
+    corporate_detail_targets = {
+        "industry_group": corporate_combo_detail_targets(holdings, target_value, "_industry_group"),
+        "industry_subgroup": corporate_combo_detail_targets(holdings, target_value, "_industry_subgroup"),
+        "issuer": corporate_combo_detail_targets(holdings, target_value, "_issuer"),
+    }
     require_dealer_inventory = not args.allow_non_inventory
     candidates = build_candidates(holdings, side, require_dealer_inventory)
     combo_targets, skipped_combo_targets = filter_combo_targets_for_available_inventory(
@@ -769,12 +882,16 @@ def main():
         target_duration,
         bucket_targets,
         combo_targets,
+        corporate_detail_targets,
         args.max_global_duration_gap,
         args.max_bucket_duration_gap,
         args.max_value_gap,
         args.min_securities_per_combo,
         args.solver_time_limit,
         args.combo_value_gap_weight,
+        args.corporate_industry_group_value_gap_weight,
+        args.corporate_industry_subgroup_value_gap_weight,
+        args.corporate_issuer_value_gap_weight,
     )
 
     actual_value, actual_duration = portfolio_stats(trades)
@@ -876,6 +993,9 @@ def main():
         "max_global_duration_gap": args.max_global_duration_gap,
         "max_bucket_duration_gap": args.max_bucket_duration_gap,
         "combo_value_gap_weight": args.combo_value_gap_weight,
+        "corporate_industry_group_value_gap_weight": args.corporate_industry_group_value_gap_weight,
+        "corporate_industry_subgroup_value_gap_weight": args.corporate_industry_subgroup_value_gap_weight,
+        "corporate_issuer_value_gap_weight": args.corporate_issuer_value_gap_weight,
         "duration_bucket_gaps": {k: round(v, 6) for k, v in sorted(bucket_gaps.items())},
         "sector_duration_combo_gaps": {k: round(v, 6) for k, v in sorted(combo_gaps.items())},
         "constraints_pass": constraints_passed,
