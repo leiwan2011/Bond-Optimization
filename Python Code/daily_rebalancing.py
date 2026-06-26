@@ -127,6 +127,8 @@ PENALTY_WEIGHTS = {
     "corporate_issuer_bucket_active_weight_gap": 0.25,
     "other_issuer_active_weight_gap": 1.0,
     "other_issuer_bucket_active_weight_gap": 0.25,
+    "provincial_municipal_issuer_combo_active_weight_gap": 0.25,
+    "agency_ssa_combo_active_weight_gap": 0.25,
     "quebec_hydro_active_weight_gap": 1.0,
     "quebec_hydro_bucket_active_weight_gap": 1.0,
 
@@ -280,6 +282,22 @@ def use_other_issuer_active_weight_rule(row):
     if row["_category_normalized"] in OTHER_ISSUER_ACTIVE_WEIGHT_EXCLUDED_CATEGORIES:
         return False
     return True
+
+
+def use_provincial_municipal_issuer_combo_penalty(row):
+    """Return True for provincial/municipal issuers in the combo-level penalty."""
+    if row["_category_normalized"] not in {"provincial", "municipal"}:
+        return False
+    if row["_issuer_family"] in OTHER_ISSUER_ACTIVE_WEIGHT_EXCLUDED_ISSUERS:
+        return False
+    if row["_issuer_family"] in QUEBEC_HYDRO_QUEBEC_ISSUERS:
+        return False
+    return True
+
+
+def use_agency_ssa_combo_penalty(row):
+    """Return True for Agency/SSA rows in the combo-level subsector penalty."""
+    return row["_category_normalized"] in {"agency", "ssa"}
 
 
 def is_valid_effective_date(value):
@@ -870,6 +888,94 @@ def build_model(holdings, solver_time_limit, solver_msg=False):
                 f"other_issuer_bucket_active_abs_{name_key}_{sanitize_name(bucket)}",
             )
             record_penalty(penalty_terms, "other_issuer_bucket_active_weight_gap", abs_gap)
+
+    # Provincial/municipal issuer active weights inside each category_group1 +
+    # duration combo. Ontario is excluded entirely, and Quebec + Hydro-Quebec
+    # are excluded here because they have their own combined rule below.
+    prov_muni_rows = [
+        row for row in holdings
+        if use_provincial_municipal_issuer_combo_penalty(row)
+    ]
+    prov_muni_combo_groups = group_rows(
+        prov_muni_rows,
+        lambda row: row["_combo_group1_bucket"],
+    )
+    all_rows_by_combo = group_rows(holdings, lambda row: row["_combo_group1_bucket"])
+    for combo, combo_prov_muni_rows in sorted(prov_muni_combo_groups.items()):
+        combo_rows = all_rows_by_combo[combo]
+        idx_combo_mv = sum(row["_idx_mv"] for row in combo_rows)
+        if idx_combo_mv <= 0:
+            continue
+        port_combo_mv = lp_sum(
+            port_end_mv_expr[row["_row_number"]]
+            for row in combo_rows
+        )
+        issuer_groups = group_rows(
+            combo_prov_muni_rows,
+            lambda row: row["_issuer_family"],
+        )
+        for group_index, (issuer_name, rows) in enumerate(sorted(issuer_groups.items())):
+            idx_issuer_combo_mv = sum(row["_idx_mv"] for row in rows)
+            if idx_issuer_combo_mv <= 0:
+                continue
+            target_weight = idx_issuer_combo_mv / idx_combo_mv
+            port_issuer_combo_mv = lp_sum(
+                port_end_mv_expr[row["_row_number"]]
+                for row in rows
+            )
+            # This linear expression is portfolio issuer MV minus the issuer's
+            # index weight inside the combo times total portfolio combo MV.
+            active_weight_gap_expr = port_issuer_combo_mv - target_weight * port_combo_mv
+            abs_gap = add_abs_gap(
+                problem,
+                active_weight_gap_expr,
+                (
+                    "prov_muni_issuer_combo_active_abs_"
+                    f"{group_index}_{sanitize_name(issuer_name)}_{sanitize_name(combo)}"
+                ),
+            )
+            record_penalty(
+                penalty_terms,
+                "provincial_municipal_issuer_combo_active_weight_gap",
+                abs_gap,
+            )
+
+    # Agency/SSA subsector active weight inside each category_group1 + duration
+    # combo. Agency and SSA are grouped together as one subsector.
+    agency_ssa_rows = [
+        row for row in holdings
+        if use_agency_ssa_combo_penalty(row)
+    ]
+    agency_ssa_combo_groups = group_rows(
+        agency_ssa_rows,
+        lambda row: row["_combo_group1_bucket"],
+    )
+    for combo, combo_agency_ssa_rows in sorted(agency_ssa_combo_groups.items()):
+        combo_rows = all_rows_by_combo[combo]
+        idx_combo_mv = sum(row["_idx_mv"] for row in combo_rows)
+        idx_agency_ssa_combo_mv = sum(row["_idx_mv"] for row in combo_agency_ssa_rows)
+        if idx_combo_mv <= 0 or idx_agency_ssa_combo_mv <= 0:
+            continue
+        target_weight = idx_agency_ssa_combo_mv / idx_combo_mv
+        port_combo_mv = lp_sum(
+            port_end_mv_expr[row["_row_number"]]
+            for row in combo_rows
+        )
+        port_agency_ssa_combo_mv = lp_sum(
+            port_end_mv_expr[row["_row_number"]]
+            for row in combo_agency_ssa_rows
+        )
+        active_weight_gap_expr = port_agency_ssa_combo_mv - target_weight * port_combo_mv
+        abs_gap = add_abs_gap(
+            problem,
+            active_weight_gap_expr,
+            f"agency_ssa_combo_active_abs_{sanitize_name(combo)}",
+        )
+        record_penalty(
+            penalty_terms,
+            "agency_ssa_combo_active_weight_gap",
+            abs_gap,
+        )
 
     # Province of Quebec and Hydro-Quebec are exempt from individual issuer
     # limits, but their combined active weight is controlled at portfolio and
@@ -1495,6 +1601,55 @@ def build_constraint_summary(results, portfolio):
                 "Limit": fmt_decimal(MAX_OTHER_ISSUER_ACTIVE_WEIGHT_GAP, 8),
                 "Status": soft_pass_fail(gap, MAX_OTHER_ISSUER_ACTIVE_WEIGHT_GAP),
             })
+
+    results_by_combo = defaultdict(list)
+    for item in results:
+        results_by_combo[item["row"]["_combo_group1_bucket"]].append(item)
+    for combo, combo_items in sorted(results_by_combo.items()):
+        idx_combo_mv = sum(item["idx_mv"] for item in combo_items)
+        port_combo_mv = sum(item["port_end_mv"] for item in combo_items)
+        if idx_combo_mv <= 0 or port_combo_mv <= 0:
+            continue
+        eligible_items = [
+            item for item in combo_items
+            if use_provincial_municipal_issuer_combo_penalty(item["row"])
+        ]
+        grouped = defaultdict(list)
+        for item in eligible_items:
+            grouped[item["row"]["_issuer_family"]].append(item)
+        for issuer_name, items in sorted(grouped.items()):
+            idx_mv = sum(item["idx_mv"] for item in items)
+            port_mv = sum(item["port_end_mv"] for item in items)
+            gap = (port_mv / port_combo_mv) - (idx_mv / idx_combo_mv)
+            rows.append({
+                "Constraint": "provincial_municipal_issuer_combo_active_weight",
+                "Group": f"{issuer_name}|{combo}",
+                "Gap": fmt_decimal(gap, 8),
+                "Limit": fmt_decimal(MAX_OTHER_ISSUER_ACTIVE_WEIGHT_GAP, 8),
+                "Status": soft_pass_fail(gap, MAX_OTHER_ISSUER_ACTIVE_WEIGHT_GAP),
+            })
+
+    for combo, combo_items in sorted(results_by_combo.items()):
+        idx_combo_mv = sum(item["idx_mv"] for item in combo_items)
+        port_combo_mv = sum(item["port_end_mv"] for item in combo_items)
+        if idx_combo_mv <= 0 or port_combo_mv <= 0:
+            continue
+        agency_ssa_items = [
+            item for item in combo_items
+            if use_agency_ssa_combo_penalty(item["row"])
+        ]
+        if not agency_ssa_items:
+            continue
+        idx_mv = sum(item["idx_mv"] for item in agency_ssa_items)
+        port_mv = sum(item["port_end_mv"] for item in agency_ssa_items)
+        gap = (port_mv / port_combo_mv) - (idx_mv / idx_combo_mv)
+        rows.append({
+            "Constraint": "agency_ssa_combo_active_weight",
+            "Group": f"agency + ssa|{combo}",
+            "Gap": fmt_decimal(gap, 8),
+            "Limit": fmt_decimal(MAX_OTHER_ISSUER_ACTIVE_WEIGHT_GAP, 8),
+            "Status": soft_pass_fail(gap, MAX_OTHER_ISSUER_ACTIVE_WEIGHT_GAP),
+        })
 
     quebec_hydro_items = [
         item for item in results
