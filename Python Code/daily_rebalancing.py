@@ -283,10 +283,20 @@ def use_other_issuer_active_weight_rule(row):
 
 
 def is_valid_effective_date(value):
-    """Return False for #N/A, blanks, and strings that are not parseable dates."""
+    """Return False only for #N/A, blanks, and unparseable date values."""
     text = str(value or "").strip()
     if not text or text.upper() == "#N/A":
         return False
+
+    # Excel CSV exports may store copied-by-value dates as serial numbers
+    # instead of text dates. Treat plausible positive serial dates as valid.
+    try:
+        serial_date = float(text.replace(",", ""))
+        if 0 < serial_date < 100000:
+            return True
+    except ValueError:
+        pass
+
     for date_format in ("%b %d, %Y", "%Y-%m-%d", "%m/%d/%Y", "%d-%b-%Y"):
         try:
             datetime.strptime(text, date_format)
