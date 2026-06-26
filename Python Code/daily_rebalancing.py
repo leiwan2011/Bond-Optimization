@@ -87,7 +87,55 @@ MAX_CORPORATE_ISSUER_ACTIVE_WEIGHT_GAP = 0.002  # 0.20%
 MAX_OTHER_ISSUER_ACTIVE_WEIGHT_GAP = 0.0015  # 0.15%
 MAX_QUEBEC_HYDRO_QUEBEC_ACTIVE_WEIGHT_GAP = 0.001  # 0.10%
 
-# 5) No-trade rules
+# 5) Penalty multipliers
+#    These weights control optimization priority without changing the model
+#    logic below. Violation penalties mean "gap above the configured limit";
+#    gap penalties mean the remaining absolute gap inside or outside the limit.
+PENALTY_WEIGHTS = {
+    # Highest priority: keep top-level tracking limits inside tolerance.
+    "portfolio_mv_violation": 1_000_000_000,
+    "portfolio_duration_violation": 1_000_000_000,
+
+    # Strong tracking penalties by category/duration and duration bucket.
+    "combo_mv_violation": 100_000_000,
+    "bucket_duration_violation": 100_000_000,
+
+    # Active-weight tolerance violations.
+    "category_group1_active_weight_violation": 1_000_000_000,
+    "category_group1_bucket_active_weight_violation": 1_000_000_000,
+    "rating_4_active_weight_violation": 1_000_000_000,
+    "corporate_industry_group_active_weight_violation": 1_000_000_000,
+    "corporate_industry_subgroup_active_weight_violation": 1_000_000_000,
+    "corporate_issuer_active_weight_violation": 1_000_000,
+    "other_issuer_active_weight_violation": 1_000_000,
+    "quebec_hydro_active_weight_violation": 1_000_000,
+    "quebec_hydro_bucket_active_weight_violation": 1_000_000,
+
+    # Residual gap polishing after the main tolerance violations are minimized.
+    "portfolio_mv_gap": 1.0,
+    "portfolio_duration_gap": 1.0,
+    "combo_mv_gap": 0.25,
+    "bucket_duration_gap": 0.25,
+    "category_group1_active_weight_gap": 1.0,
+    "category_group1_bucket_active_weight_gap": 1.0,
+    "rating_4_active_weight_gap": 1.0,
+    "corporate_industry_group_active_weight_gap": 1.0,
+    "corporate_industry_subgroup_active_weight_gap": 1.0,
+    "corporate_industry_group_bucket_active_weight_gap": 0.25,
+    "corporate_industry_subgroup_bucket_active_weight_gap": 0.25,
+    "corporate_issuer_active_weight_gap": 1.0,
+    "corporate_issuer_bucket_active_weight_gap": 0.25,
+    "other_issuer_active_weight_gap": 1.0,
+    "other_issuer_bucket_active_weight_gap": 0.25,
+    "quebec_hydro_active_weight_gap": 1.0,
+    "quebec_hydro_bucket_active_weight_gap": 1.0,
+
+    # Trading cost / operational simplicity.
+    "turnover": 0.001,
+    "optional_traded_count": 10_000,
+}
+
+# 6) No-trade rules
 NO_TRADE_INDUSTRY_SUBGROUPS = {"health"}
 NO_TRADE_CATEGORIES = {"ssa", "cash and/or derivatives"}
 CORPORATE_EXCLUDED_INDUSTRIES = {"health"}
@@ -95,7 +143,7 @@ OTHER_ISSUER_ACTIVE_WEIGHT_EXCLUDED_ISSUERS = {"ontario (province of)"}
 OTHER_ISSUER_ACTIVE_WEIGHT_EXCLUDED_CATEGORIES = {"agency", "ssa"}
 QUEBEC_HYDRO_QUEBEC_ISSUERS = {"province of quebec", "hydro-quebec"}
 
-# 6) Duration bucket definitions
+# 7) Duration bucket definitions
 DURATION_BUCKETS = (
     ("0-5", 0.0, 5.0, False),
     ("5-10", 5.0, 10.0, False),
@@ -103,7 +151,7 @@ DURATION_BUCKETS = (
     ("14-30", 14.0, 30.0, True),
 )
 
-# 7) Solver defaults
+# 8) Solver defaults
 DEFAULT_SOLVER_TIME_LIMIT_SECONDS = 60
 
 # =============================================================================
@@ -360,6 +408,22 @@ def add_violation(problem, abs_gap, allowed_gap_expr, name):
     return variable
 
 
+def record_penalty(penalty_terms, penalty_key, expression):
+    """Store a model expression under a named configurable penalty bucket."""
+    if penalty_key not in PENALTY_WEIGHTS:
+        raise KeyError(f"Missing penalty weight configuration for: {penalty_key}")
+    penalty_terms[penalty_key].append(expression)
+
+
+def weighted_penalty_objective(penalty_terms):
+    """Build the objective expression from configured penalty multipliers."""
+    return lp_sum(
+        PENALTY_WEIGHTS[penalty_key] * lp_sum(expressions)
+        for penalty_key, expressions in penalty_terms.items()
+        if PENALTY_WEIGHTS[penalty_key] != 0
+    )
+
+
 def weighted_duration(rows, value_key):
     """Calculate value-weighted duration using a row numeric value key."""
     total_value = sum(row[value_key] for row in rows)
@@ -465,10 +529,7 @@ def build_model(holdings, solver_time_limit, solver_msg=False):
     idx_duration_total = weighted_duration(holdings, "_idx_mv")
     total_port_mv = lp_sum(port_end_mv_expr[row["_row_number"]] for row in holdings)
 
-    hard_violations = []
-    issuer_violations = []
-    all_abs_gaps = []
-    soft_tracking_abs_gaps = []
+    penalty_terms = defaultdict(list)
 
     # Portfolio market value gap.
     portfolio_mv_gap = total_port_mv - total_idx_mv
@@ -479,8 +540,8 @@ def build_model(holdings, solver_time_limit, solver_msg=False):
         MAX_PORTFOLIO_MV_GAP,
         "portfolio_mv_violation",
     )
-    hard_violations.append(portfolio_mv_violation)
-    all_abs_gaps.append(portfolio_mv_abs)
+    record_penalty(penalty_terms, "portfolio_mv_violation", portfolio_mv_violation)
+    record_penalty(penalty_terms, "portfolio_mv_gap", portfolio_mv_abs)
 
     # Portfolio duration gap, expressed as dollar-duration so it stays linear.
     portfolio_duration_dollar_gap = lp_sum(
@@ -498,12 +559,11 @@ def build_model(holdings, solver_time_limit, solver_msg=False):
         MAX_PORTFOLIO_DURATION_GAP * total_port_mv,
         "portfolio_duration_violation",
     )
-    hard_violations.append(portfolio_duration_violation)
-    all_abs_gaps.append(portfolio_duration_abs)
+    record_penalty(penalty_terms, "portfolio_duration_violation", portfolio_duration_violation)
+    record_penalty(penalty_terms, "portfolio_duration_gap", portfolio_duration_abs)
 
-    # category_group1 + duration bucket market value gap. This is a soft
-    # tracking target: the optimizer still tries to reduce it, but it does not
-    # create a required violation term.
+    # category_group1 + duration bucket market value gap. It is controlled by a
+    # violation penalty above MAX_COMBO_MV_GAP plus a residual gap penalty.
     group1_bucket_groups = group_rows(
         holdings,
         lambda row: (row["_category_group1"], row["_duration_bucket"]),
@@ -511,15 +571,23 @@ def build_model(holdings, solver_time_limit, solver_msg=False):
     for (group1, bucket), rows in sorted(group1_bucket_groups.items()):
         idx_mv = sum(row["_idx_mv"] for row in rows)
         port_mv = lp_sum(port_end_mv_expr[row["_row_number"]] for row in rows)
+        safe_name = f"{sanitize_name(group1)}_{sanitize_name(bucket)}"
         abs_gap = add_abs_gap(
             problem,
             port_mv - idx_mv,
-            f"combo_mv_abs_{sanitize_name(group1)}_{sanitize_name(bucket)}",
+            f"combo_mv_abs_{safe_name}",
         )
-        soft_tracking_abs_gaps.append(abs_gap)
+        violation = add_violation(
+            problem,
+            abs_gap,
+            MAX_COMBO_MV_GAP,
+            f"combo_mv_violation_{safe_name}",
+        )
+        record_penalty(penalty_terms, "combo_mv_violation", violation)
+        record_penalty(penalty_terms, "combo_mv_gap", abs_gap)
 
-    # Duration bucket duration gap. Also soft: useful for steering the basket,
-    # but too restrictive to treat as a daily required condition.
+    # Duration bucket duration gap. It is expressed as dollar-duration so the
+    # model remains linear, with configurable violation and residual penalties.
     duration_bucket_groups = group_rows(holdings, lambda row: row["_duration_bucket"])
     for bucket, rows in sorted(duration_bucket_groups.items()):
         idx_mv = sum(row["_idx_mv"] for row in rows)
@@ -536,7 +604,14 @@ def build_model(holdings, solver_time_limit, solver_msg=False):
             bucket_duration_gap,
             f"bucket_duration_abs_{sanitize_name(bucket)}",
         )
-        soft_tracking_abs_gaps.append(abs_gap)
+        violation = add_violation(
+            problem,
+            abs_gap,
+            MAX_BUCKET_DURATION_GAP * bucket_port_mv,
+            f"bucket_duration_violation_{sanitize_name(bucket)}",
+        )
+        record_penalty(penalty_terms, "bucket_duration_violation", violation)
+        record_penalty(penalty_terms, "bucket_duration_gap", abs_gap)
 
     # category_group1 active weight at portfolio level.
     category_group1_groups = group_rows(holdings, lambda row: row["_category_group1"])
@@ -557,8 +632,8 @@ def build_model(holdings, solver_time_limit, solver_msg=False):
             MAX_CATEGORY_GROUP1_ACTIVE_WEIGHT_GAP * total_idx_mv,
             f"group1_active_violation_{sanitize_name(group1)}",
         )
-        hard_violations.append(violation)
-        all_abs_gaps.append(abs_gap)
+        record_penalty(penalty_terms, "category_group1_active_weight_violation", violation)
+        record_penalty(penalty_terms, "category_group1_active_weight_gap", abs_gap)
 
     # category_group1 active weight within each duration bucket.
     for bucket, bucket_rows in sorted(duration_bucket_groups.items()):
@@ -581,8 +656,8 @@ def build_model(holdings, solver_time_limit, solver_msg=False):
                 MAX_CATEGORY_GROUP1_ACTIVE_WEIGHT_GAP * idx_bucket_mv,
                 f"group1_bucket_active_violation_{sanitize_name(group1)}_{sanitize_name(bucket)}",
             )
-            hard_violations.append(violation)
-            all_abs_gaps.append(abs_gap)
+            record_penalty(penalty_terms, "category_group1_bucket_active_weight_violation", violation)
+            record_penalty(penalty_terms, "category_group1_bucket_active_weight_gap", abs_gap)
 
     # Rating 4 active weight at portfolio level.
     rating4_rows = [row for row in holdings if str(row["_ratings"]).strip() == "4"]
@@ -597,16 +672,18 @@ def build_model(holdings, solver_time_limit, solver_msg=False):
             MAX_RATING_4_ACTIVE_WEIGHT_GAP * total_idx_mv,
             "rating4_active_violation",
         )
-        hard_violations.append(violation)
-        all_abs_gaps.append(abs_gap)
+        record_penalty(penalty_terms, "rating_4_active_weight_violation", violation)
+        record_penalty(penalty_terms, "rating_4_active_weight_gap", abs_gap)
 
     # Corporate industry group/subgroup active weight at portfolio level.
     corporate_rows = [row for row in holdings if row["_category_group1"] == "corporate"]
-    industry_penalty_abs_gaps = []
     for field_name, normalized_key in (
         ("industry_group", "_industry_group_normalized"),
         ("industry_subgroup", "_industry_subgroup_normalized"),
     ):
+        industry_violation_key = f"corporate_{field_name}_active_weight_violation"
+        industry_gap_key = f"corporate_{field_name}_active_weight_gap"
+        industry_bucket_gap_key = f"corporate_{field_name}_bucket_active_weight_gap"
         grouped = group_rows(
             corporate_rows,
             lambda row, key=normalized_key: None
@@ -636,8 +713,8 @@ def build_model(holdings, solver_time_limit, solver_msg=False):
                 MAX_CORPORATE_INDUSTRY_ACTIVE_WEIGHT_GAP * total_idx_mv,
                 f"corp_{field_name}_active_violation_{name_key}",
             )
-            hard_violations.append(violation)
-            all_abs_gaps.append(abs_gap)
+            record_penalty(penalty_terms, industry_violation_key, violation)
+            record_penalty(penalty_terms, industry_gap_key, abs_gap)
 
         # Duration-bucket industry active weights are soft penalties.
         for bucket, bucket_rows in sorted(duration_bucket_groups.items()):
@@ -664,7 +741,7 @@ def build_model(holdings, solver_time_limit, solver_msg=False):
                     active_dollar_gap,
                     f"soft_corp_{field_name}_{name_key}_{sanitize_name(bucket)}",
                 )
-                industry_penalty_abs_gaps.append(abs_gap)
+                record_penalty(penalty_terms, industry_bucket_gap_key, abs_gap)
 
     # Corporate issuer active weight at portfolio level.
     corporate_issuer_groups = group_rows(
@@ -691,8 +768,8 @@ def build_model(holdings, solver_time_limit, solver_msg=False):
             MAX_CORPORATE_ISSUER_ACTIVE_WEIGHT_GAP * total_idx_mv,
             f"corp_issuer_active_violation_{name_key}",
         )
-        issuer_violations.append(violation)
-        all_abs_gaps.append(abs_gap)
+        record_penalty(penalty_terms, "corporate_issuer_active_weight_violation", violation)
+        record_penalty(penalty_terms, "corporate_issuer_active_weight_gap", abs_gap)
 
     # Corporate issuer active weights inside each duration bucket are soft
     # penalties. This encourages issuer balance by bucket without making the
@@ -722,7 +799,7 @@ def build_model(holdings, solver_time_limit, solver_msg=False):
                 active_dollar_gap,
                 f"soft_corp_issuer_{name_key}_{sanitize_name(bucket)}",
             )
-            industry_penalty_abs_gaps.append(abs_gap)
+            record_penalty(penalty_terms, "corporate_issuer_bucket_active_weight_gap", abs_gap)
 
     # Non-corporate issuer active weight rules. Ontario, Agency, and SSA are
     # intentionally excluded from this issuer-level limit.
@@ -754,8 +831,8 @@ def build_model(holdings, solver_time_limit, solver_msg=False):
             MAX_OTHER_ISSUER_ACTIVE_WEIGHT_GAP * total_idx_mv,
             f"other_issuer_active_violation_{name_key}",
         )
-        issuer_violations.append(violation)
-        all_abs_gaps.append(abs_gap)
+        record_penalty(penalty_terms, "other_issuer_active_weight_violation", violation)
+        record_penalty(penalty_terms, "other_issuer_active_weight_gap", abs_gap)
 
     for bucket, bucket_rows in sorted(duration_bucket_groups.items()):
         other_bucket_rows = [
@@ -782,7 +859,7 @@ def build_model(holdings, solver_time_limit, solver_msg=False):
                 active_dollar_gap,
                 f"other_issuer_bucket_active_abs_{name_key}_{sanitize_name(bucket)}",
             )
-            industry_penalty_abs_gaps.append(abs_gap)
+            record_penalty(penalty_terms, "other_issuer_bucket_active_weight_gap", abs_gap)
 
     # Province of Quebec and Hydro-Quebec are exempt from individual issuer
     # limits, but their combined active weight is controlled at portfolio and
@@ -806,8 +883,8 @@ def build_model(holdings, solver_time_limit, solver_msg=False):
             MAX_QUEBEC_HYDRO_QUEBEC_ACTIVE_WEIGHT_GAP * total_idx_mv,
             "quebec_hydro_active_violation",
         )
-        issuer_violations.append(violation)
-        all_abs_gaps.append(abs_gap)
+        record_penalty(penalty_terms, "quebec_hydro_active_weight_violation", violation)
+        record_penalty(penalty_terms, "quebec_hydro_active_weight_gap", abs_gap)
 
     for bucket, bucket_rows in sorted(duration_bucket_groups.items()):
         quebec_hydro_bucket_rows = [
@@ -834,27 +911,18 @@ def build_model(holdings, solver_time_limit, solver_msg=False):
             MAX_QUEBEC_HYDRO_QUEBEC_ACTIVE_WEIGHT_GAP * idx_bucket_mv,
             f"quebec_hydro_bucket_active_violation_{sanitize_name(bucket)}",
         )
-        issuer_violations.append(violation)
-        all_abs_gaps.append(abs_gap)
+        record_penalty(penalty_terms, "quebec_hydro_bucket_active_weight_violation", violation)
+        record_penalty(penalty_terms, "quebec_hydro_bucket_active_weight_gap", abs_gap)
 
     turnover = lp_sum(abs_trade_mv_vars.values())
     optional_traded_count = lp_sum(traded_flag_vars.values())
+    record_penalty(penalty_terms, "turnover", turnover)
+    record_penalty(penalty_terms, "optional_traded_count", optional_traded_count)
 
-    # Large weights preserve business priority:
-    # 1. minimize tracking-limit violations
-    # 2. minimize residual tracking gaps
-    # 3. minimize corporate industry bucket active-weight soft gaps
-    # 4. minimize turnover
-    # 5. minimize optional traded name count
-    problem += (
-        1_000_000_000 * lp_sum(hard_violations)
-        + 1_000_000 * lp_sum(issuer_violations)
-        + 1 * lp_sum(all_abs_gaps)
-        + 0.25 * lp_sum(soft_tracking_abs_gaps)
-        + 0.25 * lp_sum(industry_penalty_abs_gaps)
-        + 0.001 * turnover
-        + 10_000 * optional_traded_count
-    )
+    # The objective is entirely controlled by PENALTY_WEIGHTS in the
+    # configuration section. To change business priority, adjust those
+    # multipliers without changing the model logic.
+    problem += weighted_penalty_objective(penalty_terms)
 
     solver = pulp.PULP_CBC_CMD(msg=solver_msg, timeLimit=solver_time_limit)
     status_code = problem.solve(solver)
@@ -869,6 +937,7 @@ def build_model(holdings, solver_time_limit, solver_msg=False):
         "abs_trade_mv_vars": abs_trade_mv_vars,
         "traded_flag_vars": traded_flag_vars,
         "trade_lot_vars": trade_lot_vars,
+        "penalty_terms": penalty_terms,
         "total_idx_mv": total_idx_mv,
         "idx_duration_total": idx_duration_total,
     }
@@ -878,6 +947,22 @@ def value_of(expression):
     """Return a numeric value for constants or PuLP expressions."""
     value = pulp.value(expression)
     return 0.0 if value is None else float(value)
+
+
+def summarize_penalties(model):
+    """Summarize configured penalty buckets after the solver has run."""
+    rows = []
+    for penalty_key, expressions in sorted(model.get("penalty_terms", {}).items()):
+        raw_value = sum(value_of(expression) for expression in expressions)
+        weight = PENALTY_WEIGHTS[penalty_key]
+        rows.append({
+            "penalty": penalty_key,
+            "terms": len(expressions),
+            "weight": weight,
+            "raw_value": raw_value,
+            "weighted_value": raw_value * weight,
+        })
+    return rows
 
 
 def calculated_results(holdings, model):
@@ -1068,6 +1153,7 @@ def write_outputs(output_dir, holdings, model, solver_time_limit):
             "other_issuer_active_weight_gap": MAX_OTHER_ISSUER_ACTIVE_WEIGHT_GAP,
             "quebec_hydro_quebec_active_weight_gap": MAX_QUEBEC_HYDRO_QUEBEC_ACTIVE_WEIGHT_GAP,
         },
+        "penalty_weights": PENALTY_WEIGHTS,
     }
     return summary
 
@@ -1129,15 +1215,22 @@ def build_log_text(model, solver_time_limit, portfolio, results, constraint_rows
     lines.append("")
     lines.append("Limits")
     lines.append(f"- Portfolio MV gap: {fmt_money(MAX_PORTFOLIO_MV_GAP)}")
-    lines.append(f"- Category group1 + duration MV gap: {fmt_money(MAX_COMBO_MV_GAP)} (soft penalty)")
+    lines.append(f"- Category group1 + duration MV gap: {fmt_money(MAX_COMBO_MV_GAP)} (penalty)")
     lines.append(f"- Portfolio duration gap: {fmt_decimal(MAX_PORTFOLIO_DURATION_GAP, 8)}")
-    lines.append(f"- Duration bucket duration gap: {fmt_decimal(MAX_BUCKET_DURATION_GAP, 8)} (soft penalty)")
+    lines.append(f"- Duration bucket duration gap: {fmt_decimal(MAX_BUCKET_DURATION_GAP, 8)} (penalty)")
     lines.append(f"- Category group1 active weight: {fmt_decimal(MAX_CATEGORY_GROUP1_ACTIVE_WEIGHT_GAP, 8)}")
     lines.append(f"- Rating 4 active weight: {fmt_decimal(MAX_RATING_4_ACTIVE_WEIGHT_GAP, 8)}")
     lines.append(f"- Corporate industry active weight: {fmt_decimal(MAX_CORPORATE_INDUSTRY_ACTIVE_WEIGHT_GAP, 8)}")
     lines.append(f"- Corporate issuer active weight: {fmt_decimal(MAX_CORPORATE_ISSUER_ACTIVE_WEIGHT_GAP, 8)}")
     lines.append(f"- Other issuer active weight: {fmt_decimal(MAX_OTHER_ISSUER_ACTIVE_WEIGHT_GAP, 8)}")
     lines.append(f"- Quebec + Hydro-Quebec active weight: {fmt_decimal(MAX_QUEBEC_HYDRO_QUEBEC_ACTIVE_WEIGHT_GAP, 8)}")
+    lines.append("")
+    lines.append("Penalty Multipliers")
+    for row in summarize_penalties(model):
+        lines.append(
+            f"- {row['penalty']}: weight {row['weight']}, terms {row['terms']}, "
+            f"raw {fmt_decimal(row['raw_value'], 6)}, weighted {fmt_decimal(row['weighted_value'], 6)}"
+        )
     lines.append("")
     lines.append("Constraint Audit")
     pass_count = sum(1 for row in constraint_rows if row["Status"] == "PASS")
@@ -1146,16 +1239,25 @@ def build_log_text(model, solver_time_limit, portfolio, results, constraint_rows
     lines.append(f"- PASS: {pass_count}")
     lines.append(f"- FAIL: {fail_count}")
     lines.append(f"- SOFT: {soft_count}")
-    failed_constraints = [row for row in failed_constraints if row["Status"] != "SOFT"]
-    if failed_constraints:
+    hard_failed_constraints = [row for row in failed_constraints if row["Status"] != "SOFT"]
+    soft_constraints = [row for row in failed_constraints if row["Status"] == "SOFT"]
+    if hard_failed_constraints:
         lines.append("")
         lines.append("Failed Constraints")
-        for row in failed_constraints:
+        for row in hard_failed_constraints:
             lines.append(
                 f"- {row['Constraint']} | {row['Group']} | gap {row['Gap']} | limit {row['Limit']}"
             )
     else:
-        lines.append("- All listed constraints passed.")
+        lines.append("- All required constraints passed.")
+
+    if soft_constraints:
+        lines.append("")
+        lines.append("Soft Penalty Constraints Above Limit")
+        for row in soft_constraints:
+            lines.append(
+                f"- {row['Constraint']} | {row['Group']} | gap {row['Gap']} | limit {row['Limit']}"
+            )
 
     append_group_summary(lines, "Category Group1 Summary", group1_rows)
     append_group_summary(lines, "Category Group1 + Duration Summary", group1_bucket_rows)
@@ -1197,6 +1299,11 @@ def pass_fail(abs_gap, limit):
     return "PASS" if abs(abs_gap) <= limit + 1e-9 else "FAIL"
 
 
+def soft_pass_fail(abs_gap, limit):
+    """Return PASS inside limit and SOFT when only the penalty is carrying it."""
+    return "PASS" if abs(abs_gap) <= limit + 1e-9 else "SOFT"
+
+
 def build_constraint_summary(results, portfolio):
     """Create an audit table for the main tracking constraints."""
     rows = []
@@ -1230,7 +1337,7 @@ def build_constraint_summary(results, portfolio):
             "Group": row["group"],
             "Gap": fmt_decimal(row["mv_gap"], 8),
             "Limit": fmt_decimal(MAX_COMBO_MV_GAP, 8),
-            "Status": "SOFT",
+            "Status": soft_pass_fail(row["mv_gap"], MAX_COMBO_MV_GAP),
         })
 
     duration_rows = summarize_groups(results, lambda row: row["_duration_bucket"], total_idx_mv, total_port_mv)
@@ -1240,7 +1347,7 @@ def build_constraint_summary(results, portfolio):
             "Group": row["group"],
             "Gap": fmt_decimal(row["duration_gap"], 8),
             "Limit": fmt_decimal(MAX_BUCKET_DURATION_GAP, 8),
-            "Status": "SOFT",
+            "Status": soft_pass_fail(row["duration_gap"], MAX_BUCKET_DURATION_GAP),
         })
 
     # category_group1 active weight inside each duration bucket.
@@ -1376,7 +1483,7 @@ def build_constraint_summary(results, portfolio):
                 "Group": f"{issuer_name}|{bucket}",
                 "Gap": fmt_decimal(gap, 8),
                 "Limit": fmt_decimal(MAX_OTHER_ISSUER_ACTIVE_WEIGHT_GAP, 8),
-                "Status": "SOFT",
+                "Status": soft_pass_fail(gap, MAX_OTHER_ISSUER_ACTIVE_WEIGHT_GAP),
             })
 
     quebec_hydro_items = [
