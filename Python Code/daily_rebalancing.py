@@ -73,6 +73,7 @@ CANADA_HOUSING_TRUST_ROUND_LOT = 5000
 CANADA_HOUSING_TRUST_ISSUER = "canada housing trust"
 ISSUED_AMOUNT_MULTIPLIER = 1000
 MAX_TRADE_FRACTION_OF_ISSUED_AMOUNT = 0.5
+MIN_NORMAL_TRADE_QTY = 10000
 PRICE_DIVISOR = 100.0
 
 # 4) Tracking limits
@@ -505,6 +506,8 @@ def build_model(holdings, solver_time_limit, solver_msg=False):
         max_buy_lots = int(math.floor(max_trade_qty / round_lot))
         max_sell_lots = int(math.floor(row["_pre_trade_qty"] / round_lot))
         max_sell_lots = min(max_sell_lots, max_buy_lots)
+        min_buy_lots = int(math.ceil(MIN_NORMAL_TRADE_QTY / round_lot))
+        min_sell_lots = min(max_sell_lots, min_buy_lots)
 
         # If a name has no allowed trade capacity, keep it fixed.
         if max_buy_lots == 0 and max_sell_lots == 0:
@@ -543,9 +546,22 @@ def build_model(holdings, solver_time_limit, solver_msg=False):
         problem += abs_trade_mv >= -trade_mv, f"abs_trade_mv_neg_{row_id}"
 
         flag = pulp.LpVariable(f"traded_flag_{row_id}", lowBound=0, upBound=1, cat="Binary")
-        big_m_lots = max(max_buy_lots, max_sell_lots, 1)
-        problem += signed_lots <= big_m_lots * flag, f"flag_buy_link_{row_id}"
-        problem += -signed_lots <= big_m_lots * flag, f"flag_sell_link_{row_id}"
+        buy_flag = pulp.LpVariable(f"buy_flag_{row_id}", lowBound=0, upBound=1, cat="Binary")
+        sell_flag = pulp.LpVariable(f"sell_flag_{row_id}", lowBound=0, upBound=1, cat="Binary")
+        problem += buy_flag + sell_flag == flag, f"trade_direction_flag_{row_id}"
+
+        # If a normal tradable name is bought, it must trade at least
+        # MIN_NORMAL_TRADE_QTY. If a position smaller than that is sold, the
+        # minimum sell size is the available pre-trade position. Roll-out and
+        # no-trade rows do not reach this branch.
+        problem += signed_lots <= max_buy_lots * buy_flag, f"buy_lot_max_{row_id}"
+        problem += signed_lots >= -max_sell_lots * sell_flag, f"sell_lot_max_{row_id}"
+        problem += (
+            signed_lots >= min_buy_lots * buy_flag - max_sell_lots * sell_flag
+        ), f"buy_min_trade_lots_{row_id}"
+        problem += (
+            signed_lots <= max_buy_lots * buy_flag - min_sell_lots * sell_flag
+        ), f"sell_min_trade_lots_{row_id}"
 
         trade_qty_expr[row_id] = trade_qty
         post_qty_expr[row_id] = post_qty
