@@ -37,7 +37,8 @@ except ImportError as exc:
 # 1) Trade assumptions
 #    These are the main parameters most users change between runs.
 #    Positive = create/spend cash. Negative = redemption/raise cash.
-DEFAULT_CASH_SPEND_RAISE = 1_411_000.0
+#    None means calculate from sum(idx_mv) - sum(port_end_mv) in the input file.
+DEFAULT_CASH_SPEND_RAISE = None
 DEFAULT_MAX_VALUE_GAP_CAD = 300.0
 DEFAULT_MAX_GLOBAL_DURATION_GAP = 0.1
 DEFAULT_MAX_BUCKET_DURATION_GAP = 0.2
@@ -79,6 +80,8 @@ COLUMN_MAPPING = {
     "ticker": "Ticker",
     "category": "Category",
     "ratings": "Ratings",
+    "idx_mv": "Market Value",
+    "port_end_mv": "Port End MV",
 
     # Required classification field
     "sector": "Sector",
@@ -196,7 +199,7 @@ def normalized_config_values(values):
     return {normalize_match_value(value) for value in values}
 
 
-def validate_required_columns(fieldnames):
+def validate_required_columns(fieldnames, require_cash_calculation_columns=False):
     """Fail early if the input CSV does not contain required mapped columns."""
     required_fields = [
         "shares",
@@ -208,6 +211,8 @@ def validate_required_columns(fieldnames):
         "ticker",
         "sector",
     ]
+    if require_cash_calculation_columns:
+        required_fields.extend(["idx_mv", "port_end_mv"])
     missing = [
         COLUMN_MAPPING[field]
         for field in required_fields
@@ -258,11 +263,11 @@ def duration_bucket(duration):
     return "out-of-range"
 
 
-def read_holdings(path):
+def read_holdings(path, require_cash_calculation_columns=False):
     """Load the holdings CSV and enrich each row with internal numeric fields."""
     with path.open(newline="", encoding="utf-8-sig") as handle:
         reader = csv.DictReader(handle)
-        validate_required_columns(reader.fieldnames or [])
+        validate_required_columns(reader.fieldnames or [], require_cash_calculation_columns)
         rows = list(reader)
 
     holdings = []
@@ -273,6 +278,8 @@ def read_holdings(path):
         bmk_weight = parse_number(input_value(row, "bmk_weight"))
         issued_amount = parse_number(input_value(row, "issued_amount"))
         price = parse_number(input_value(row, "price"))
+        idx_mv = parse_number(input_value(row, "idx_mv"))
+        port_end_mv = parse_number(input_value(row, "port_end_mv"))
         if price <= 0:
             continue
 
@@ -285,6 +292,8 @@ def read_holdings(path):
         row["_dealer_inventory"] = dealer_inventory
         row["_bmk_weight"] = bmk_weight
         row["_issued_amount"] = issued_amount
+        row["_idx_mv"] = idx_mv
+        row["_port_end_mv"] = port_end_mv
         row["_price"] = price
         row["_price_per_share"] = price_per_share
         row["_sector_group"] = group
@@ -301,6 +310,13 @@ def read_holdings(path):
         holdings.append(row)
 
     return holdings
+
+
+def calculate_cash_spend_raise_from_holdings(holdings):
+    """Calculate create/redemption cash from input index MV minus portfolio MV."""
+    total_idx_mv = sum(row["_idx_mv"] for row in holdings)
+    total_port_end_mv = sum(row["_port_end_mv"] for row in holdings)
+    return total_idx_mv - total_port_end_mv, total_idx_mv, total_port_end_mv
 
 
 def benchmark_weighted_duration(rows):
@@ -1032,7 +1048,10 @@ def main():
         "--cash-spend-raise",
         type=float,
         default=DEFAULT_CASH_SPEND_RAISE,
-        help="Positive cash means create/spend cash; negative cash means redemption/raise cash.",
+        help=(
+            "Optional override. Positive cash means create/spend cash; negative cash means "
+            "redemption/raise cash. Default is sum(idx_mv) - sum(port_end_mv) from input file."
+        ),
     )
     parser.add_argument("--max-global-duration-gap", type=float, default=DEFAULT_MAX_GLOBAL_DURATION_GAP)
     parser.add_argument("--max-bucket-duration-gap", type=float, default=DEFAULT_MAX_BUCKET_DURATION_GAP)
@@ -1099,12 +1118,20 @@ def main():
         help="Allow securities without positive Dealer Inventory. Default uses only Dealer Inventory > 0.",
     )
     args = parser.parse_args()
-    if abs(args.cash_spend_raise) < 1e-9:
-        raise ValueError("cash_spend_raise cannot be zero. Use a positive value for create or a negative value for redemption.")
-    side = "create" if args.cash_spend_raise > 0 else "redemption"
-    target_value = abs(args.cash_spend_raise)
+    auto_cash_spend_raise = args.cash_spend_raise is None
 
-    holdings = read_holdings(args.input)
+    holdings = read_holdings(
+        args.input,
+        require_cash_calculation_columns=auto_cash_spend_raise,
+    )
+    calculated_cash_spend_raise, total_idx_mv, total_port_end_mv = calculate_cash_spend_raise_from_holdings(holdings)
+    cash_spend_raise = calculated_cash_spend_raise if auto_cash_spend_raise else args.cash_spend_raise
+
+    if abs(cash_spend_raise) < 1e-9:
+        raise ValueError("cash_spend_raise cannot be zero. Use a positive value for create or a negative value for redemption.")
+    side = "create" if cash_spend_raise > 0 else "redemption"
+    target_value = abs(cash_spend_raise)
+
     non_trade_issuers = read_non_trade_issuers(args.non_trade_issuer_list)
     target_duration = benchmark_weighted_duration(holdings)
     bucket_targets = duration_bucket_targets(holdings, target_value)
@@ -1265,7 +1292,15 @@ def main():
         "solver_status": solver_summary["solver_status"],
         "solver_time_limit_seconds": args.solver_time_limit,
         "side": side,
-        "cash_spend_raise": round(args.cash_spend_raise, 2),
+        "cash_spend_raise": round(cash_spend_raise, 2),
+        "cash_spend_raise_source": (
+            "input_file_sum_idx_mv_minus_sum_port_end_mv"
+            if auto_cash_spend_raise else "command_line_override"
+        ),
+        "cash_calculation_idx_mv_column": COLUMN_MAPPING["idx_mv"],
+        "cash_calculation_port_end_mv_column": COLUMN_MAPPING["port_end_mv"],
+        "cash_calculation_total_idx_mv": round(total_idx_mv, 2),
+        "cash_calculation_total_port_end_mv": round(total_port_end_mv, 2),
         "target_market_value_cad": round(target_value, 2),
         "actual_trade_market_value_cad": round(actual_value, 2),
         "market_value_gap_cad": round(value_gap, 2),
@@ -1364,7 +1399,7 @@ def main():
     }
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    suffix_cash = f"{abs(args.cash_spend_raise):,.0f}".replace(",", "")
+    suffix_cash = f"{abs(cash_spend_raise):,.0f}".replace(",", "")
     suffix = f"{side}_cash_{suffix_cash}_pulp"
     trades_path = args.output_dir / f"XBB_trade_optimization_{suffix}.csv"
     bucket_path = args.output_dir / f"XBB_trade_optimization_{suffix}_bucket_summary.csv"
